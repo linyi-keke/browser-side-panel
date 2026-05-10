@@ -1,0 +1,561 @@
+// background.js - 负责管理录制会话、处理消息、监听标签页和导航事件
+// 存储录制会话
+var recordingSessions = {};
+var currentSessionId = null;
+var isRecording = false;
+var currentTabId = null;
+var recordedTabs = new Set();
+var autoSaveFileName = '';
+
+function generateSessionId() {
+  return 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+}
+
+function generateFileName(url, title) {
+  var now = new Date();
+  var dateStr = now.getFullYear() +
+    String(now.getMonth() + 1).padStart(2, '0') +
+    String(now.getDate()).padStart(2, '0') +
+    '_' +
+    String(now.getHours()).padStart(2, '0') +
+    String(now.getMinutes()).padStart(2, '0') +
+    String(now.getSeconds()).padStart(2, '0');
+  
+  var shortName = 'recording';
+  try {
+    if (url) {
+      var urlObj = new URL(url);
+      shortName = urlObj.hostname.replace(/^www\./, '').split('.')[0];
+      shortName = shortName.replace(/[^a-zA-Z0-9\u4e00-\u9fa5_-]/g, '_');
+    }
+  } catch (e) {
+    if (title) {
+      shortName = title.replace(/[^a-zA-Z0-9\u4e00-\u9fa5_-]/g, '_').substring(0, 30);
+    }
+  }
+  
+  if (!shortName || shortName === '_') shortName = 'recording';
+  
+  return shortName + '_' + dateStr + '.json';
+}
+
+// 初始化
+chrome.runtime.onInstalled.addListener(async function() {
+  console.log('浏览器操作追踪器 v4.2 已安装');
+  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+  
+  await chrome.storage.local.set({
+    sessions: {},
+    currentSessionId: null,
+    isRecording: false,
+    actionHistory: [],
+    currentTabId: null
+  });
+});
+
+chrome.action.onClicked.addListener(function(tab) {
+  chrome.sidePanel.open({ windowId: tab.windowId });
+});
+
+// 确保content script在标签页中运行
+async function ensureContentScriptInjected(tabId) {
+  if (recordedTabs.has(tabId)) return true;
+  
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      files: ['content.js']
+    });
+    recordedTabs.add(tabId);
+    console.log('Content script 已注入到标签页:', tabId);
+    return true;
+  } catch (e) {
+    console.log('注入content script:', e.message);
+    recordedTabs.add(tabId);
+    return true;
+  }
+}
+
+// 保存会话数据到本地存储
+async function saveSessionToStorage(sessionId) {
+  if (!recordingSessions[sessionId]) return;
+  var key = 'session_' + sessionId;
+  await chrome.storage.local.set({ [key]: recordingSessions[sessionId] });
+}
+
+// 开始录制
+async function startRecording(url, title, tabId) {
+  currentSessionId = generateSessionId();
+  isRecording = true;
+  currentTabId = tabId;
+  recordedTabs = new Set();
+  
+  if (tabId) recordedTabs.add(tabId);
+  
+  autoSaveFileName = generateFileName(url, title);
+  
+  recordingSessions[currentSessionId] = {
+    id: currentSessionId,
+    fileName: autoSaveFileName,
+    startUrl: url,
+    startTitle: title,
+    startTabId: tabId,
+    startTime: new Date().toISOString(),
+    endTime: null,
+    windowSize: null,
+    actions: [],
+    tabSwitches: [],
+    urls: [{ url: url, title: title, tabId: tabId, timestamp: new Date().toISOString() }]
+  };
+  
+  await chrome.storage.local.set({
+    sessions: recordingSessions,
+    currentSessionId: currentSessionId,
+    isRecording: isRecording,
+    actionHistory: [],
+    currentTabId: currentTabId,
+    currentFileName: autoSaveFileName
+  });
+  
+  console.log('开始录制:', currentSessionId, '文件:', autoSaveFileName);
+  
+  return { sessionId: currentSessionId, fileName: autoSaveFileName };
+}
+
+// 停止录制
+async function stopRecording() {
+  if (!currentSessionId || !recordingSessions[currentSessionId]) return null;
+  
+  recordingSessions[currentSessionId].endTime = new Date().toISOString();
+  isRecording = false;
+  var sessionId = currentSessionId;
+  var session = Object.assign({}, recordingSessions[currentSessionId]);
+  
+  await saveSessionToStorage(sessionId);
+  
+  currentSessionId = null;
+  currentTabId = null;
+  
+  await chrome.storage.local.set({
+    sessions: recordingSessions,
+    isRecording: false,
+    currentSessionId: null,
+    currentTabId: null
+  });
+  
+  console.log('停止录制:', sessionId, '操作数:', session.actions ? session.actions.length : 0);
+  
+  chrome.runtime.sendMessage({
+    type: 'recordingStopped',
+    data: { sessionId: sessionId, fileName: session.fileName, actionsCount: session.actions ? session.actions.length : 0 }
+  }).catch(function() {});
+  
+  return session;
+}
+
+// 更新窗口信息
+async function updateWindowInfo(windowInfo) {
+  chrome.runtime.sendMessage({
+    type: 'windowInfoUpdated',
+    data: windowInfo
+  }).catch(function() {});
+}
+
+// 记录标签页切换
+async function recordTabSwitch(fromTabId, toTabId, url, title) {
+  if (!isRecording || !currentSessionId) return;
+  
+  currentTabId = toTabId;
+  await ensureContentScriptInjected(toTabId);
+  
+  var switchData = {
+    type: 'tabSwitch',
+    fromTabId: fromTabId,
+    toTabId: toTabId,
+    url: url,
+    title: title,
+    timestamp: new Date().toISOString(),
+    timeOffset: Date.now() - new Date(recordingSessions[currentSessionId].startTime).getTime()
+  };
+  
+  recordingSessions[currentSessionId].tabSwitches.push(switchData);
+  recordingSessions[currentSessionId].urls.push({ 
+    url: url, title: title, tabId: toTabId, timestamp: new Date().toISOString() 
+  });
+  
+  await chrome.storage.local.set({ 
+    sessions: recordingSessions,
+    currentTabId: currentTabId 
+  });
+  
+  try {
+    await chrome.tabs.sendMessage(toTabId, { action: 'updateRecordingStatus', isRecording: true });
+  } catch (e) {}
+  
+  chrome.runtime.sendMessage({
+    type: 'tabSwitched',
+    data: { tabId: toTabId, url: url, title: title }
+  }).catch(function() {});
+}
+
+// 记录URL变化
+async function recordUrlChange(tabId, url, title) {
+  if (!isRecording || !currentSessionId) return;
+  if (currentTabId !== tabId) return;
+  
+  var urlData = { url: url, title: title, tabId: tabId, timestamp: new Date().toISOString() };
+  
+  recordingSessions[currentSessionId].urls.push(urlData);
+  await chrome.storage.local.set({ sessions: recordingSessions });
+  
+  chrome.runtime.sendMessage({
+    type: 'urlChanged',
+    data: { url: url, title: title, tabId: tabId }
+  }).catch(function() {});
+}
+
+// 记录操作
+async function recordAction(action) {
+  console.log('记录操作:', action.type, action.target ? action.target.tagName : '');
+  
+  var storageData = await chrome.storage.local.get(['actionHistory']);
+  var actionHistory = storageData.actionHistory || [];
+  
+  action.tabId = currentTabId;
+  
+  if (action.type === 'navigation') {
+    if (!action.url && recordingSessions[currentSessionId]) {
+      action.url = recordingSessions[currentSessionId].startUrl;
+    }
+    if (!action.title && recordingSessions[currentSessionId]) {
+      action.title = recordingSessions[currentSessionId].startTitle;
+    }
+  }
+  
+  if (currentSessionId && recordingSessions[currentSessionId]) {
+    var urls = recordingSessions[currentSessionId].urls;
+    var lastUrl = urls.length > 0 ? urls[urls.length - 1] : null;
+    if (lastUrl) {
+      action.pageUrl = lastUrl.url;
+      action.pageTitle = lastUrl.title;
+    }
+  }
+  
+  actionHistory.unshift(action);
+  
+  if (actionHistory.length > 200) actionHistory.length = 200;
+  
+  await chrome.storage.local.set({ actionHistory: actionHistory });
+  
+  chrome.runtime.sendMessage({
+    type: 'actionHistoryUpdated',
+    data: actionHistory
+  }).catch(function() {});
+  
+  if (isRecording && currentSessionId && recordingSessions[currentSessionId]) {
+    var timeOffset = Date.now() - new Date(recordingSessions[currentSessionId].startTime).getTime();
+    
+    recordingSessions[currentSessionId].actions.push(Object.assign({}, action, { timeOffset: timeOffset }));
+    
+    if (recordingSessions[currentSessionId].actions.length % 5 === 0) {
+      await saveSessionToStorage(currentSessionId);
+    }
+  }
+}
+
+// 导出会话到文件
+async function exportSessionToFile(sessionId, customName) {
+  var session = recordingSessions[sessionId];
+  
+  if (!session) {
+    var key = 'session_' + sessionId;
+    var data = await chrome.storage.local.get([key]);
+    if (!data[key]) return null;
+    session = data[key];
+  }
+  
+  var fileName = (customName || session.fileName || 'recording').replace(/[<>:"/\\|?*]/g, '_');
+  
+  var exportData = {
+    sessionId: session.id,
+    name: fileName,
+    startUrl: session.startUrl,
+    startTime: session.startTime,
+    endTime: session.endTime,
+    totalSteps: session.actions ? session.actions.length : 0,
+    urls: session.urls || [],
+    steps: session.actions || [],
+    actions: session.actions || [],
+    tabSwitches: session.tabSwitches || []
+  };
+  
+  var jsonData = JSON.stringify(exportData, null, 2);
+  var dataUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(jsonData);
+  
+  try {
+    await chrome.downloads.download({
+      url: dataUrl,
+      filename: 'recordings/' + fileName + '.json',
+      saveAs: false
+    });
+    console.log('导出成功:', fileName);
+    return fileName;
+  } catch (error) {
+    console.error('导出失败:', error);
+    return null;
+  }
+}
+
+// 消息处理
+chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
+  (async function() {
+    try {
+      switch (request.type) {
+        case 'injectReplayScript':
+          // 获取当前活动标签页
+          var activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+          var activeTab = activeTabs[0];
+          if (activeTab && activeTab.id) {
+            try {
+              await chrome.scripting.executeScript({
+                target: { tabId: activeTab.id },
+                files: ['replay-inject.js']
+              });
+              console.log('通过 background 注入 replay-inject.js 成功');
+              sendResponse({ success: true });
+            } catch (e) {
+              console.error('注入失败:', e);
+              sendResponse({ success: false, error: e.message });
+            }
+          } else {
+            sendResponse({ success: false, error: 'No active tab' });
+          }
+          break;
+
+        case 'startRecording':
+          var tabId = sender.tab ? sender.tab.id : request.tabId;
+          var result = await startRecording(request.url, request.title, tabId);
+          sendResponse({ success: true, sessionId: result.sessionId, fileName: result.fileName });
+          break;
+          
+        case 'stopRecording':
+          var session = await stopRecording();
+          sendResponse({ success: true, session: session });
+          break;
+          
+        case 'recordAction':
+          await recordAction(request.data);
+          sendResponse({ success: true });
+          break;
+          
+        case 'updateWindowInfo':
+          await updateWindowInfo(request.data);
+          sendResponse({ success: true });
+          break;
+          
+        case 'replayStepResult':
+        case 'replayStatus':
+          chrome.runtime.sendMessage({ type: request.type, data: request.data }).catch(function() {});
+          sendResponse({ success: true });
+          break;
+          
+        case 'getRecordingStatus':
+          sendResponse({ isRecording: isRecording, currentSessionId: currentSessionId, currentTabId: currentTabId });
+          break;
+          
+        case 'getActionHistory':
+          var ahData = await chrome.storage.local.get(['actionHistory']);
+          sendResponse({ actionHistory: ahData.actionHistory || [] });
+          break;
+          
+        case 'clearHistory':
+          await chrome.storage.local.set({ actionHistory: [] });
+          sendResponse({ success: true });
+          break;
+          
+        case 'updateStepName':
+          var snData = await chrome.storage.local.get(['actionHistory']);
+          var snHistory = snData.actionHistory || [];
+          if (request.index >= 0 && request.index < snHistory.length) {
+            snHistory[request.index].stepName = request.stepName;
+            await chrome.storage.local.set({ actionHistory: snHistory });
+          }
+          sendResponse({ success: true });
+          break;
+          
+        case 'deleteStep':
+          var dsData = await chrome.storage.local.get(['actionHistory']);
+          var dsHistory = dsData.actionHistory || [];
+          if (request.index >= 0 && request.index < dsHistory.length) {
+            dsHistory.splice(request.index, 1);
+            dsHistory.forEach(function(action, i) { action.stepNumber = dsHistory.length - i; });
+            await chrome.storage.local.set({ actionHistory: dsHistory });
+          }
+          sendResponse({ success: true });
+          break;
+
+        case 'updateStepInfo':
+          var usData = await chrome.storage.local.get(['actionHistory']);
+          var usHistory = usData.actionHistory || [];
+          if (request.index >= 0 && request.index < usHistory.length) {
+            usHistory[request.index] = Object.assign({}, usHistory[request.index], request.data);
+            await chrome.storage.local.set({ actionHistory: usHistory });
+          }
+          sendResponse({ success: true });
+          break;
+          
+        case 'getCurrentTabInfo':
+          try {
+            var tab = await chrome.tabs.get(currentTabId || (sender.tab ? sender.tab.id : null));
+            sendResponse({ url: tab.url, title: tab.title, tabId: tab.id });
+          } catch (e) {
+            sendResponse({ url: '', title: '', tabId: null });
+          }
+          break;
+
+        case 'getSessionUrls':
+          var urls = (currentSessionId && recordingSessions[currentSessionId]) ? (recordingSessions[currentSessionId].urls || []) : [];
+          sendResponse({ urls: urls });
+          break;
+
+        case 'exportSession':
+          var fn = await exportSessionToFile(request.sessionId, request.fileName);
+          sendResponse({ success: !!fn, fileName: fn });
+          break;
+
+        case 'getAllSessions':
+          var allData = await chrome.storage.local.get(null);
+          var sessions = [];
+          for (var key in allData) {
+            if (allData.hasOwnProperty(key) && key.indexOf('session_') === 0 && allData[key].id) {
+              sessions.push({
+                id: allData[key].id,
+                fileName: allData[key].fileName,
+                startUrl: allData[key].startUrl,
+                startTime: allData[key].startTime,
+                actionsCount: allData[key].actions ? allData[key].actions.length : 0
+              });
+            }
+          }
+          sessions.sort(function(a, b) { return new Date(b.startTime) - new Date(a.startTime); });
+          sendResponse({ sessions: sessions });
+          break;
+
+        case 'deleteSession':
+          var dk = 'session_' + request.sessionId;
+          await chrome.storage.local.remove(dk);
+          if (recordingSessions[request.sessionId]) delete recordingSessions[request.sessionId];
+          sendResponse({ success: true });
+          break;
+
+        case 'autoSave':
+          if (currentSessionId && recordingSessions[currentSessionId]) {
+            recordingSessions[currentSessionId].lastAutoSave = request.data;
+            await saveSessionToStorage(currentSessionId);
+          }
+          sendResponse({ success: true });
+          break;
+
+        case 'globalStopReplay':
+          // 停止所有标签页的回放
+          var allTabs = await chrome.tabs.query({});
+          for (var i = 0; i < allTabs.length; i++) {
+            try {
+              await chrome.tabs.sendMessage(allTabs[i].id, { action: 'stopReplayScript' });
+            } catch (e) {}
+            try {
+              await chrome.scripting.executeScript({
+                target: { tabId: allTabs[i].id },
+                func: function() {
+                  sessionStorage.removeItem('__replay_remaining_steps__');
+                  if (window.__replayer) {
+                    window.__replayer.stop();
+                    window.__replayer = null;
+                  }
+                }
+              });
+            } catch (e) {}
+          }
+          sendResponse({ success: true });
+          break;
+          
+        default:
+          console.warn('未知消息类型:', request.type);
+          sendResponse({ success: false, error: 'Unknown message type' });
+      }
+    } catch (error) {
+      console.error('Background处理消息失败:', request.type, error);
+      sendResponse({ success: false, error: error.message });
+    }
+  })();
+  
+  return true;
+});
+
+// 监听标签页激活
+chrome.tabs.onActivated.addListener(async function(activeInfo) {
+  if (!isRecording) return;
+  
+  try {
+    var tab = await chrome.tabs.get(activeInfo.tabId);
+    if (tab && tab.id !== currentTabId) {
+      var oldTabId = currentTabId;
+      await recordTabSwitch(oldTabId, tab.id, tab.url, tab.title);
+      console.log('标签页切换:', oldTabId, '->', tab.id);
+    }
+  } catch (e) {
+    console.error('标签页切换记录失败:', e);
+  }
+});
+
+// 监听标签页更新（URL变化）
+chrome.tabs.onUpdated.addListener(async function(tabId, changeInfo, tab) {
+  if (!isRecording) return;
+  
+  if (changeInfo.status === 'complete' && tab.url) {
+    await ensureContentScriptInjected(tabId);
+    
+    if (tabId === currentTabId) {
+      // ✅ 只有当URL真正变化时才记录
+      var session = recordingSessions[currentSessionId];
+      if (session) {
+        var urls = session.urls;
+        var lastUrl = urls.length > 0 ? urls[urls.length - 1] : null;
+        
+        // 检查是否与上次记录的URL相同
+        if (!lastUrl || lastUrl.url !== tab.url) {
+          await recordUrlChange(tabId, tab.url, tab.title);
+          console.log('页面跳转完成，新URL:', tab.url);
+        }
+      }
+    }
+  }
+});
+
+// 监听页面导航完成，自动注入回放脚本
+chrome.webNavigation.onCompleted.addListener(async function(details) {
+  // 只处理主框架
+  if (details.frameId !== 0) return;
+  
+  // 检查是否有待回放的步骤
+  try {
+    var result = await chrome.scripting.executeScript({
+      target: { tabId: details.tabId },
+      func: function() {
+        return sessionStorage.getItem('__replay_remaining_steps__');
+      }
+    });
+    
+    if (result && result[0] && result[0].result) {
+      console.log('检测到待回放步骤，注入回放脚本:', details.tabId);
+      
+      // 注入回放脚本
+      await chrome.scripting.executeScript({
+        target: { tabId: details.tabId },
+        files: ['replay-inject.js']
+      });
+    }
+  } catch (e) {
+    console.log('检查待回放步骤失败:', e);
+  }
+});

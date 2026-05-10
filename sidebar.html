@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="sidebar.css">
+</head>
+<body>
+  <div class="sidebar-container">
+    <!-- 头部 -->
+    <div class="sidebar-header">
+      <div class="header-title">
+        <span class="logo">📐</span>
+        <h2>操作追踪器</h2>
+      </div>
+      <div class="header-controls">
+        <button id="startBtn" class="btn btn-record"><span>⏺️</span> 录制</button>
+        <button id="stopBtn" class="btn btn-stop" disabled><span>⏹️</span> 停止</button>
+      </div>
+    </div>
+    
+    <!-- 录制状态指示器 -->
+    <div id="recordingIndicator" class="recording-indicator hidden">
+      <div class="pulse-dot"></div>
+      <div class="recording-info">
+        <span>录制中</span>
+        <span id="currentFileName" class="file-name"></span>
+      </div>
+      <span id="recordingTime" class="recording-time">00:00</span>
+      <span id="stepCount" class="step-count">步骤: 0</span>
+    </div>
+
+    <!-- URL信息显示 -->
+    <div class="url-info-section">
+      <div class="url-info-item">
+        <span class="url-label">🌐 当前页面</span>
+        <span class="url-value" id="currentTitle" title="">-</span>
+      </div>
+      <div class="url-info-item url-full">
+        <span class="url-value url-text" id="currentUrl" title="">-</span>
+      </div>
+    </div>
+    
+    <!-- 窗口信息卡片 -->
+    <div class="info-section">
+      <div class="section-title"><span>🖥️</span> 窗口信息</div>
+      <div class="window-info-grid">
+        <div class="info-item"><span class="info-label">窗口宽度</span><span class="info-value" id="windowWidth">-</span></div>
+        <div class="info-item"><span class="info-label">窗口高度</span><span class="info-value" id="windowHeight">-</span></div>
+        <div class="info-item"><span class="info-label">视口宽度</span><span class="info-value" id="viewportWidth">-</span></div>
+        <div class="info-item"><span class="info-label">视口高度</span><span class="info-value" id="viewportHeight">-</span></div>
+      </div>
+    </div>
+    
+    <!-- 筛选按钮 -->
+    <div class="filter-section">
+      <button class="filter-btn active" data-filter="all">全部</button>
+      <button class="filter-btn" data-filter="click">🖱️ 点击</button>
+      <button class="filter-btn" data-filter="scroll">📜 滚动</button>
+      <button class="filter-btn" data-filter="resize">📏 调整</button>
+    </div>
+    
+    <!-- 操作历史列表 -->
+    <div class="action-list" id="actionList">
+      <div class="empty-state">
+        <div class="empty-icon">📊</div>
+        <p>等待录制</p>
+        <p class="empty-hint">点击 ⏺️ 录制 按钮开始</p>
+      </div>
+    </div>
+
+    <!-- 回放控制面板 -->
+    <div id="replayPanel" class="replay-panel hidden">
+      <div class="replay-header">
+        <h3>🎬 回放控制</h3>
+        <button id="closeReplayBtn" class="btn-icon">✕</button>
+      </div>
+      <div class="replay-info">
+        <div class="replay-file-info">
+          <span class="replay-file-name" id="replayFileName">-</span>
+          <span class="replay-step-info" id="replayStepInfo"></span>
+        </div>
+        <div class="replay-progress-container">
+          <div class="replay-progress-bar" id="replayProgressBar"></div>
+        </div>
+        <div class="replay-current-step" id="replayCurrentStep">
+          <span class="text-muted">等待开始...</span>
+        </div>
+      </div>
+      <div class="replay-controls">
+        <button id="replayPrevBtn" class="btn btn-replay-control" title="上一步">⏮</button>
+        <button id="replayPlayBtn" class="btn btn-replay-play" title="播放">▶️</button>
+        <button id="replayPauseBtn" class="btn btn-replay-control hidden" title="暂停">⏸️</button>
+        <button id="replayStopBtn" class="btn btn-replay-control" title="停止">⏹️</button>
+        <button id="replayNextBtn" class="btn btn-replay-control" title="下一步">⏭</button>
+      </div>
+      <div class="replay-speed-control">
+    <span class="speed-label">速度:</span>
+    <button class="speed-btn" data-speed="0.5">0.5x</button>
+    <button class="speed-btn active" data-speed="1">1x</button>
+    <button class="speed-btn" data-speed="2">2x</button>
+    <button class="speed-btn" data-speed="3">3x</button>
+  </div>
+
+  <!-- 回放日志窗口 -->
+  <div class="replay-log-container" id="replayLogContainer">
+    <div class="replay-log-header">
+      <span>📋 执行日志</span>
+      <button id="clearLogBtn" class="btn-log-clear" title="清空日志">🗑️</button>
+    </div>
+    <div class="replay-log-content" id="replayLogContent">
+      <div class="log-entry log-info">等待回放开始...</div>
+    </div>
+  </div>
+</div>
+<!-- 回放面板结束 -->
+
+    <!-- 底部控制区 -->
+    <div class="sidebar-footer">
+      <button id="importBtn" class="btn btn-import"><span>📥</span> 导入</button>
+      <button id="exportBtn" class="btn btn-export"><span>💾</span> 导出</button>
+      <button id="clearBtn" class="btn btn-clear"><span>🗑️</span> 清空</button>
+    </div>
+  </div>
+
+  <input type="file" id="fileInput" accept=".json" style="display: none;">
+  
+  <!-- 导出对话框 -->
+  <div id="exportDialog" class="dialog-overlay hidden">
+    <div class="dialog">
+      <div class="dialog-header">
+        <h3>💾 导出录制数据</h3>
+        <button id="closeDialogBtn" class="dialog-close">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <div class="form-group">
+          <label for="fileName">文件名称</label>
+          <input type="text" id="fileName" class="form-input" placeholder="输入文件名称">
+          <span class="form-hint">默认: 录制_YYYYMMDD_HHmmss</span>
+        </div>
+        <div class="form-group">
+          <label for="fileDescription">备注说明（可选）</label>
+          <textarea id="fileDescription" class="form-input form-textarea" rows="2" placeholder="添加备注说明..."></textarea>
+        </div>
+        <div class="export-summary" id="exportSummary"></div>
+      </div>
+      <div class="dialog-footer">
+        <button id="cancelExportBtn" class="btn btn-cancel">取消</button>
+        <button id="confirmExportBtn" class="btn btn-confirm">确认导出</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- 编辑步骤名称对话框 -->
+  <div id="editStepDialog" class="dialog-overlay hidden">
+    <div class="dialog dialog-small">
+      <div class="dialog-header">
+        <h3>✏️ 编辑步骤名称</h3>
+        <button id="closeEditDialogBtn" class="dialog-close">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <div class="form-group">
+          <label>步骤编号</label>
+          <span id="editStepNumber" class="step-number-display"></span>
+        </div>
+        <div class="form-group">
+          <label for="editStepName">步骤名称</label>
+          <input type="text" id="editStepName" class="form-input" placeholder="输入步骤名称">
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button id="cancelEditBtn" class="btn btn-cancel">取消</button>
+        <button id="confirmEditBtn" class="btn btn-confirm">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 修改步骤信息对话框 -->
+  <div id="editStepInfoDialog" class="dialog-overlay hidden">
+    <div class="dialog">
+      <div class="dialog-header">
+        <h3>✏️ 修改步骤信息</h3>
+        <button id="closeEditInfoDialogBtn" class="dialog-close">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <div class="form-group">
+          <label>步骤编号</label>
+          <span id="editInfoStepNumber" class="step-number-display"></span>
+        </div>
+        <div class="form-group">
+          <label>操作类型</label>
+          <span id="editInfoStepType" class="step-type-display"></span>
+        </div>
+        <div class="form-group">
+          <label for="editInfoStepName">步骤名称</label>
+          <input type="text" id="editInfoStepName" class="form-input" placeholder="输入步骤名称">
+        </div>
+        <div class="form-group" id="editInfoCoordGroup" style="display:none;">
+          <label>坐标信息</label>
+          <div class="coord-edit-row">
+            <div class="coord-edit-item"><label class="coord-label">X</label><input type="number" id="editInfoCoordX" class="form-input form-input-small" placeholder="X坐标"></div>
+            <div class="coord-edit-item"><label class="coord-label">Y</label><input type="number" id="editInfoCoordY" class="form-input form-input-small" placeholder="Y坐标"></div>
+          </div>
+        </div>
+        <div class="form-group" id="editInfoValueGroup" style="display:none;">
+          <label for="editInfoValue">输入内容</label>
+          <input type="text" id="editInfoValue" class="form-input" placeholder="输入内容">
+        </div>
+        <div class="form-group" id="editInfoUrlGroup" style="display:none;">
+          <label for="editInfoUrl">页面URL</label>
+          <input type="text" id="editInfoUrl" class="form-input" placeholder="页面URL">
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button id="cancelEditInfoBtn" class="btn btn-cancel">取消</button>
+        <button id="confirmEditInfoBtn" class="btn btn-confirm">保存</button>
+      </div>
+    </div>
+  </div>
+  
+  <script src="sidebar.js"></script>
+</body>
+</html>
