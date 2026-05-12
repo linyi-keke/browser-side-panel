@@ -119,6 +119,10 @@ async function getCurrentTab() {
   return tabs[0];
 }
 
+function isRestrictedTabUrl(url) {
+  return !url || /^(chrome|edge|brave|opera|vivaldi|about):/i.test(url);
+}
+
 // ==================== 窗口信息 ====================
 
 function updateWindowInfo(data) {
@@ -175,6 +179,7 @@ async function startRecording() {
     currentPageUrl = tab.url;
     currentPageTitle = tab.title;
     updateUrlDisplay(tab.url, tab.title);
+    var startsOnRestrictedPage = isRestrictedTabUrl(tab.url);
     
     await chrome.runtime.sendMessage({ type: 'clearHistory' });
     actionHistory = [];
@@ -206,6 +211,10 @@ async function startRecording() {
       try { await chrome.tabs.sendMessage(tab.id, { action: 'updateRecordingStatus', isRecording: true }); } catch (e) {}
       
       var fileNameDisplay = document.getElementById('currentFileName');
+      if (startsOnRestrictedPage) {
+        showToast('当前页无法注入脚本，打开普通网页后会开始录制');
+        return;
+      }
       if (fileNameDisplay && response.fileName) fileNameDisplay.textContent = '📁 ' + response.fileName;
       
       showToast('🔴 录制已开始');
@@ -220,6 +229,8 @@ async function stopRecording() {
   try {
     var response = await chrome.runtime.sendMessage({ type: 'stopRecording' });
     if (response && response.success) {
+      var stoppedSession = response.session || {};
+      var stoppedSteps = normalizeReplaySteps(stoppedSession.actions || actionHistory);
       isRecording = false;
       currentSessionId = null;
       startBtn.disabled = false;
@@ -230,6 +241,13 @@ async function stopRecording() {
       recordingTime.textContent = '00:00';
       var tab = await getCurrentTab();
       if (tab) { try { await chrome.tabs.sendMessage(tab.id, { action: 'updateRecordingStatus', isRecording: false }); } catch (e) {} }
+      if (stoppedSteps.length > 0) {
+        replaySteps = stoppedSteps;
+        stepResults = {};
+        showReplayPanel(stoppedSession.fileName || currentFileName || 'current-recording', replaySteps);
+        renderReplayList();
+        addReplayLog('录制结束，已加载当前录制步骤，可直接回放或导出', 'info');
+      }
       showToast('⏹️ 录制已停止 - 共 ' + stepCounter + ' 个步骤');
     }
   } catch (error) {
@@ -654,11 +672,31 @@ async function clearHistory() {
   stepCounter = 0;
   stepResults = {};
   updateStepCount();
-  renderActionList([]);
+  renderActionList(actionHistory);
   showToast('已清空');
 }
 
 // ==================== 导入/回放 ====================
+
+function normalizeReplaySteps(steps) {
+  steps = (steps || []).filter(function(s) { return s && s.type; }).map(function(step) {
+    return Object.assign({}, step, { target: Object.assign({}, step.target || {}) });
+  });
+  steps.sort(function(a, b) {
+    var numA = a.stepNumber || 999;
+    var numB = b.stepNumber || 999;
+    return numA - numB;
+  });
+  steps.forEach(function(step, i) {
+    step.stepNumber = i + 1;
+    if (!step.target) step.target = {};
+    if (!step.target.textContent && step.target.textContent === undefined) step.target.textContent = '';
+    if (!step.target.className) step.target.className = '';
+    if (!step.target.id) step.target.id = '';
+    if (!step.target.tagName) step.target.tagName = '';
+  });
+  return steps;
+}
 
 function importFile() {
   var fi = document.getElementById('fileInput');
@@ -683,12 +721,15 @@ async function handleFileSelect(event) {
     if (!steps.length) { showToast('文件中没有操作步骤'); event.target.value = ''; return; }
     
     // ✅ 按 stepNumber 升序排列（步骤1, 2, 3...）
+    steps = normalizeReplaySteps(steps);
+    /*
     steps = steps.filter(function(s) { return s && s.type; });
     steps.sort(function(a, b) {
       var numA = a.stepNumber || 999;
       var numB = b.stepNumber || 999;
       return numA - numB;  // 升序：小的在前面
     });
+    */
     
     // 重新编号确保连续
     steps.forEach(function(s, i) { s.stepNumber = i + 1; });
@@ -789,7 +830,7 @@ function closeReplayPanel() {
   
   // ✅ 清空日志
   clearReplayLog();
-  renderActionList([]);
+  renderActionList(actionHistory);
 
   // ✅ 额外清理一次
   clearReplayStorage();
@@ -1096,7 +1137,9 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
       
     case 'replayLog':
       // 只处理日志，不再额外添加
-      addReplayLogDirect(request.data.message, request.data.level);
+      var replayLogData = request.data || {};
+      var replayLogPrefix = replayLogData.stepNumber ? ('#' + replayLogData.stepNumber + ' ') : '';
+      addReplayLogDirect(replayLogPrefix + (replayLogData.message || ''), replayLogData.level);
       break;
   }
   sendResponse({ received: true });
@@ -1137,7 +1180,7 @@ function addReplayLogDirect(message, type) {
   
   // 限制日志数量
   var entries = logContent.querySelectorAll('.log-entry');
-  if (entries.length > 100) {
+  if (entries.length > 500) {
     entries[0].remove();
   }
 }
@@ -1148,7 +1191,15 @@ var _processedStepResults = {};
 
 function handleReplayStepResult(data) {
   var index = data.index;
-  var stepKey = 'step_' + index + '_' + data.success;
+  if (data.stepNumber != null) {
+    for (var replayIndex = 0; replayIndex < replaySteps.length; replayIndex++) {
+      if (replaySteps[replayIndex] && replaySteps[replayIndex].stepNumber === data.stepNumber) {
+        index = replayIndex;
+        break;
+      }
+    }
+  }
+  var stepKey = 'step_' + (data.stepNumber != null ? data.stepNumber : index) + '_' + data.success;
   
   // 防止重复处理
   if (_processedStepResults[stepKey]) {
@@ -1257,6 +1308,12 @@ function handleReplayStatus(data) {
 
     case 'completed':
       if (navigatingTimeout) clearTimeout(navigatingTimeout);
+      for (var completedIndex = 0; completedIndex < replaySteps.length; completedIndex++) {
+        if (!stepResults[completedIndex] || stepResults[completedIndex] === 'pending') {
+          stepResults[completedIndex] = 'success';
+        }
+      }
+      renderReplayList();
       if (pb) pb.style.width = '100%';
       if (cs) cs.innerHTML = '<span style="color:#34d399;">✅ 回放完成</span>';
       isReplaying = false;

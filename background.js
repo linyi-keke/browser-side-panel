@@ -425,6 +425,7 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
           
         case 'replayStepResult':
         case 'replayStatus':
+        case 'replayLog':
           chrome.runtime.sendMessage({ type: request.type, data: request.data }).catch(function() {});
           sendResponse({ success: true });
           break;
@@ -583,9 +584,12 @@ chrome.tabs.onUpdated.addListener(async function(tabId, changeInfo, tab) {
   if (!isRecording) return;
   
   if (changeInfo.status === 'complete' && tab.url) {
-    await ensureContentScriptInjected(tabId);
+    var contentReady = await ensureContentScriptInjected(tabId);
     
     if (tabId === currentTabId) {
+      if (contentReady) {
+        await setTabRecordingStatus(tabId, true);
+      }
       // ✅ 只有当URL真正变化时才记录
       var session = recordingSessions[currentSessionId];
       if (session) {
