@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "浏览器操作追踪器",
-  "version": "6.9",
+  "version": "7.7",
   "description": "侧边栏显示浏览器窗口尺寸和页面操作坐标，支持录制回放",
   "permissions": [
     "activeTab",

@@ -124,6 +124,7 @@
   // 构建操作数据
   function buildActionData(type, event) {
     var target = event.target;
+    var rect = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
     
     return {
       type: type,
@@ -144,7 +145,15 @@
         type: target.type || '',
         name: target.name || '',
         placeholder: target.placeholder || '',
-        selector: getElementSelector(target)
+        selector: getElementSelector(target),
+        rect: rect ? {
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height
+        } : null,
+        clickOffsetX: rect ? event.clientX - rect.left : null,
+        clickOffsetY: rect ? event.clientY - rect.top : null
       }
     };
   }
@@ -198,48 +207,69 @@
     if (!isRecording) return;
     sendAction(buildActionData('dblclick', e));
   });
+
+  // 存储每个输入框的最终值（用于聚合）
+var pendingInputValues = new Map();
+var pendingInputTimers = new Map();
   
   // 监听输入
   document.addEventListener('input', function(e) {
-    if (!isRecording) return;
-    
-    var target = e.target;
-    if (!isEditableElement(target)) return;
-    
-    var key = getElementSelector(target) || target.name || target.id || 'unknown';
-    
-    if (inputValueTracker.has(key)) clearTimeout(inputValueTracker.get(key).timer);
-    
-    var previousValue = inputValueTracker.get(key) ? inputValueTracker.get(key).previousValue : '';
-    
-    inputValueTracker.set(key, {
-      timer: setTimeout(function() {
-        var actionData = {
-          type: 'input',
-          value: target.value || target.textContent || '',
-          previousValue: previousValue,
-          viewportWidth: windowInfo.viewportWidth,
-          viewportHeight: windowInfo.viewportHeight,
-          windowWidth: windowInfo.windowWidth,
-          windowHeight: windowInfo.windowHeight,
-          timestamp: new Date().toISOString(),
-          target: {
-            tagName: target.tagName,
-            id: target.id || '',
-            className: (target.className && typeof target.className === 'string') ? target.className : '',
-            type: target.type || '',
-            name: target.name || '',
-            placeholder: target.placeholder || '',
-            selector: getElementSelector(target)
-          }
-        };
-        
-        sendAction(actionData);
-        inputValueTracker.delete(key);
-      }, 300),
-      previousValue: target.value || target.textContent || ''
-    });
-  }, true);
+  if (!isRecording) return;
+  
+  var target = e.target;
+  if (!isEditableElement(target)) return;
+  
+  // 生成输入框的唯一标识
+  var inputKey = getElementSelector(target) || target.name || target.id || 'unknown';
+  
+  // 获取当前值
+  var currentValue = target.value || target.textContent || '';
+  
+  // 存储最终值
+  pendingInputValues.set(inputKey, currentValue);
+  
+  // 清除之前的定时器
+  if (pendingInputTimers.has(inputKey)) {
+    clearTimeout(pendingInputTimers.get(inputKey));
+  }
+  
+  // ✅ 设置新的定时器，用户停止输入 500ms 后保存最终值
+  var timer = setTimeout(function() {
+    var finalValue = pendingInputValues.get(inputKey);
+    if (finalValue !== undefined) {
+      var previousValue = ''; // 可以从之前的记录获取，这里简化
+      
+      var actionData = {
+        type: 'input',
+        value: finalValue,
+        previousValue: previousValue,
+        viewportWidth: windowInfo.viewportWidth,
+        viewportHeight: windowInfo.viewportHeight,
+        windowWidth: windowInfo.windowWidth,
+        windowHeight: windowInfo.windowHeight,
+        timestamp: new Date().toISOString(),
+        target: {
+          tagName: target.tagName,
+          id: target.id || '',
+          className: (target.className && typeof target.className === 'string') ? target.className : '',
+          type: target.type || '',
+          name: target.name || '',
+          placeholder: target.placeholder || '',
+          selector: getElementSelector(target)
+        }
+      };
+      
+      sendAction(actionData);
+      console.log('保存最终输入值:', finalValue);
+      
+      // 清理
+      pendingInputValues.delete(inputKey);
+      pendingInputTimers.delete(inputKey);
+    }
+  }, 500); // 500ms 无输入后保存
+  
+  pendingInputTimers.set(inputKey, timer);
+}, true);
   
   // 监听键盘
   document.addEventListener('keydown', function(e) {
@@ -327,12 +357,42 @@
   
   // 页面卸载前
   window.addEventListener('beforeunload', function() {
-    if (isRecording && scrollTimer) {
-      clearTimeout(scrollTimer);
-      sendScrollPosition();
+  // ✅ 在页面跳转前，保存所有未完成的输入
+  pendingInputValues.forEach(function(finalValue, key) {
+    if (finalValue !== undefined) {
+      var history = { lastValue: finalValue };
+      var actionData = {
+        type: 'input',
+        value: finalValue,
+        previousValue: '',
+        viewportWidth: windowInfo.viewportWidth,
+        viewportHeight: windowInfo.viewportHeight,
+        windowWidth: windowInfo.windowWidth,
+        windowHeight: windowInfo.windowHeight,
+        timestamp: new Date().toISOString(),
+        target: {
+          tagName: 'INPUT',
+          selector: key
+        }
+      };
+      sendAction(actionData);
+      console.log('页面跳转前保存输入:', history.lastValue);
     }
-    inputValueTracker.clear();
   });
+  
+  if (isRecording && scrollTimer) {
+    clearTimeout(scrollTimer);
+    sendScrollPosition();
+  }
+  
+  // 清理所有定时器
+  pendingInputTimers.forEach(function(timer) {
+    clearTimeout(timer);
+  });
+  pendingInputValues.clear();
+  pendingInputTimers.clear();
+  inputValueTracker.clear();
+});
   
   // 响应消息
   chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
@@ -459,5 +519,15 @@ window.addEventListener('beforeunload', function() {
     }).catch(function(e) {
       console.log('发送注入请求失败:', e);
     });
+    
+    // 添加重试机制：如果3秒后还没有回放脚本，再次请求
+    setTimeout(function() {
+      if (!window.__replayer && !window.__replay_injected) {
+        console.log('重试：再次请求注入回放脚本');
+        chrome.runtime.sendMessage({ 
+          type: 'injectReplayScript'
+        }).catch(function(e) {});
+      }
+    }, 3000);
   }
 })();

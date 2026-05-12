@@ -119,6 +119,10 @@ async function getCurrentTab() {
   return tabs[0];
 }
 
+function isRestrictedTabUrl(url) {
+  return !url || /^(chrome|edge|brave|opera|vivaldi|about):/i.test(url);
+}
+
 // ==================== 窗口信息 ====================
 
 function updateWindowInfo(data) {
@@ -175,6 +179,7 @@ async function startRecording() {
     currentPageUrl = tab.url;
     currentPageTitle = tab.title;
     updateUrlDisplay(tab.url, tab.title);
+    var startsOnRestrictedPage = isRestrictedTabUrl(tab.url);
     
     await chrome.runtime.sendMessage({ type: 'clearHistory' });
     actionHistory = [];
@@ -206,6 +211,10 @@ async function startRecording() {
       try { await chrome.tabs.sendMessage(tab.id, { action: 'updateRecordingStatus', isRecording: true }); } catch (e) {}
       
       var fileNameDisplay = document.getElementById('currentFileName');
+      if (startsOnRestrictedPage) {
+        showToast('当前页无法注入脚本，打开普通网页后会开始录制');
+        return;
+      }
       if (fileNameDisplay && response.fileName) fileNameDisplay.textContent = '📁 ' + response.fileName;
       
       showToast('🔴 录制已开始');
@@ -220,6 +229,8 @@ async function stopRecording() {
   try {
     var response = await chrome.runtime.sendMessage({ type: 'stopRecording' });
     if (response && response.success) {
+      var stoppedSession = response.session || {};
+      var stoppedSteps = normalizeReplaySteps(stoppedSession.actions || actionHistory);
       isRecording = false;
       currentSessionId = null;
       startBtn.disabled = false;
@@ -230,6 +241,13 @@ async function stopRecording() {
       recordingTime.textContent = '00:00';
       var tab = await getCurrentTab();
       if (tab) { try { await chrome.tabs.sendMessage(tab.id, { action: 'updateRecordingStatus', isRecording: false }); } catch (e) {} }
+      if (stoppedSteps.length > 0) {
+        replaySteps = stoppedSteps;
+        stepResults = {};
+        showReplayPanel(stoppedSession.fileName || currentFileName || 'current-recording', replaySteps);
+        renderReplayList();
+        addReplayLog('录制结束，已加载当前录制步骤，可直接回放或导出', 'info');
+      }
       showToast('⏹️ 录制已停止 - 共 ' + stepCounter + ' 个步骤');
     }
   } catch (error) {
@@ -588,15 +606,43 @@ function closeExportDialog() { exportDialog.classList.add('hidden'); }
 async function confirmExport() {
   var fileName = fileNameInput.value.trim() || '录制_' + Date.now();
   fileName = fileName.replace(/[<>:"/\\|?*]/g, '_');
+
+  // 在导出时过滤掉中间输入步骤
+  var filteredSteps = [];
+  var lastInputKey = null;
+
+  // 需要先反转成正常顺序再处理
+  var reversedHistory = [].concat(actionHistory).reverse();
+
+  for (var i = 0; i < reversedHistory.length; i++) {
+    var action = reversedHistory[i];
+    
+    if (action.type === 'input') {
+      var inputKey = (action.target && (action.target.selector || action.target.id)) || '';
+      if (lastInputKey === inputKey && inputKey !== '') {
+        // 替换上一个输入步骤（只保留最后一个）
+        if (filteredSteps.length > 0) {
+          filteredSteps[filteredSteps.length - 1] = action;
+        }
+      } else {
+        filteredSteps.push(action);
+        lastInputKey = inputKey;
+      }
+    } else {
+      filteredSteps.push(action);
+      lastInputKey = null;
+    }
+  }
   
+  // 使用 filteredSteps
   var exportData = {
     name: fileName,
-    description: fileDescriptionInput.value.trim(),
+    description: fileDescriptionInput.value.trim() || '',
     exportTime: new Date().toISOString(),
-    totalSteps: actionHistory.length,
-    steps: actionHistory.map(function(action, i) {
+    totalSteps: filteredSteps.length,
+    steps: filteredSteps.map(function(action, i) {
       var obj = Object.assign({}, action);
-      obj.stepNumber = action.stepNumber || (actionHistory.length - i);
+      obj.stepNumber = i + 1;  // 重新编号，从1开始
       obj.stepName = action.stepName || null;
       return obj;
     })
@@ -614,7 +660,10 @@ async function confirmExport() {
     URL.revokeObjectURL(url);
     closeExportDialog();
     showToast('✅ 已导出: ' + fileName + '.json');
-  } catch (e) { showToast('导出失败'); }
+  } catch (e) {
+    console.error('导出失败:', e);
+    showToast('导出失败: ' + e.message);
+  }
 }
 
 async function clearHistory() {
@@ -623,11 +672,31 @@ async function clearHistory() {
   stepCounter = 0;
   stepResults = {};
   updateStepCount();
-  renderActionList([]);
+  renderActionList(actionHistory);
   showToast('已清空');
 }
 
 // ==================== 导入/回放 ====================
+
+function normalizeReplaySteps(steps) {
+  steps = (steps || []).filter(function(s) { return s && s.type; }).map(function(step) {
+    return Object.assign({}, step, { target: Object.assign({}, step.target || {}) });
+  });
+  steps.sort(function(a, b) {
+    var numA = a.stepNumber || 999;
+    var numB = b.stepNumber || 999;
+    return numA - numB;
+  });
+  steps.forEach(function(step, i) {
+    step.stepNumber = i + 1;
+    if (!step.target) step.target = {};
+    if (!step.target.textContent && step.target.textContent === undefined) step.target.textContent = '';
+    if (!step.target.className) step.target.className = '';
+    if (!step.target.id) step.target.id = '';
+    if (!step.target.tagName) step.target.tagName = '';
+  });
+  return steps;
+}
 
 function importFile() {
   var fi = document.getElementById('fileInput');
@@ -652,12 +721,15 @@ async function handleFileSelect(event) {
     if (!steps.length) { showToast('文件中没有操作步骤'); event.target.value = ''; return; }
     
     // ✅ 按 stepNumber 升序排列（步骤1, 2, 3...）
+    steps = normalizeReplaySteps(steps);
+    /*
     steps = steps.filter(function(s) { return s && s.type; });
     steps.sort(function(a, b) {
       var numA = a.stepNumber || 999;
       var numB = b.stepNumber || 999;
       return numA - numB;  // 升序：小的在前面
     });
+    */
     
     // 重新编号确保连续
     steps.forEach(function(s, i) { s.stepNumber = i + 1; });
@@ -747,6 +819,7 @@ function showReplayPanel(fileName, steps) {
 
 function closeReplayPanel() {
   stopReplayInPage();
+
   replaySteps = [];
   isReplaying = false;
   isReplayPaused = false;
@@ -757,7 +830,7 @@ function closeReplayPanel() {
   
   // ✅ 清空日志
   clearReplayLog();
-  renderActionList([]);
+  renderActionList(actionHistory);
 
   // ✅ 额外清理一次
   clearReplayStorage();
@@ -791,36 +864,49 @@ async function startReplayInPage() {
       return;
     }
     
-    // ✅ 先清理所有旧的回放数据（新增）
+    // 1. 清理所有旧的回放数据（通过脚本注入）
+    // ✅ 彻底清理所有回放相关数据
+    console.log('========== 开始新回放，清理旧数据 ==========');
+
     try {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: function() {
+          // 清除所有存储
           sessionStorage.removeItem('__replay_remaining_steps__');
           sessionStorage.removeItem('__replay_speed__');
           sessionStorage.removeItem('__replay_current_index__');
           sessionStorage.removeItem('__replay_injected__');
+          localStorage.removeItem('__replay_global_stop__');
+          
+          // 重置所有标记
+          window.__replay_pending_checked__ = false;
+          window.__replay_injected = false;
+          
+          // 停止旧回放器
           if (window.__replayer) {
             window.__replayer.stop();
             window.__replayer = null;
           }
-          console.log('已清理旧的回放数据');
+          
+          console.log('旧回放数据已清理');
         }
       });
-      await new Promise(function(r) { setTimeout(r, 300); });
     } catch (e) {
       console.log('清理数据失败:', e);
     }
     
-    // 先停止之前的回放，清除残留状态
-    try {
-      await chrome.tabs.sendMessage(tab.id, { action: 'stopReplayScript' });
-      await new Promise(function(r) { setTimeout(r, 300); });
-    } catch (e) {}
+    // 等待清理完成
+    await new Promise(function(r) { setTimeout(r, 500); });
     
     // 排序步骤
     replaySteps.sort(function(a, b) {
       return (a.stepNumber || 0) - (b.stepNumber || 0);
+    });
+    
+    // 重新编号
+    replaySteps.forEach(function(step, idx) {
+      step.stepNumber = idx + 1;
     });
     
     stepResults = {};
@@ -835,23 +921,30 @@ async function startReplayInPage() {
     
     // 注入回放脚本
     try {
+      console.log('注入 replay-inject.js...');
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         files: ['replay-inject.js']
       });
-      await new Promise(function(r) { setTimeout(r, 500); });
+      await new Promise(function(r) { setTimeout(r, 800); });
+      console.log('注入完成');
     } catch (e) {
-      console.log('脚本注入:', e);
+      console.error('脚本注入失败:', e);
+      addReplayLog('❌ 脚本注入失败: ' + e.message, 'error');
+      showToast('脚本注入失败，请刷新页面重试');
+      return;
     }
     
     // 发送回放指令
-    var response = await chrome.tabs.sendMessage(tab.id, { 
-      action: 'startReplayScript', 
+    var response = await chrome.tabs.sendMessage(tab.id, {
+      action: 'startReplayScript',
       steps: replaySteps,
-      speed: replaySpeed, 
-      highlight: true, 
-      fromIndex: 0 
+      speed: replaySpeed,
+      highlight: true,
+      fromIndex: 0
     });
+    
+    console.log('回放启动响应:', response);
     
     if (response && response.success) {
       isReplaying = true;
@@ -888,10 +981,6 @@ async function stopReplayInPage() {
   var tab = await getCurrentTab();
   
   // ✅ 设置全局停止标志（防止新页面自动恢复回放）
-  localStorage.setItem('__replay_global_stop__', 'true');
-  setTimeout(function() {
-    localStorage.removeItem('__replay_global_stop__');
-  }, 3000);
   
   // 1. 发送停止消息到当前页面
   if (tab && tab.id) {
@@ -911,11 +1000,19 @@ async function stopReplayInPage() {
         await chrome.scripting.executeScript({
           target: { tabId: allTabs[i].id },
           func: function() {
+            localStorage.setItem('__replay_global_stop__', 'true');
+            setTimeout(function() {
+              localStorage.removeItem('__replay_global_stop__');
+            }, 3000);
             // 清除回放相关的存储
             sessionStorage.removeItem('__replay_remaining_steps__');
             sessionStorage.removeItem('__replay_speed__');
             sessionStorage.removeItem('__replay_current_index__');
             sessionStorage.removeItem('__replay_injected__');
+            
+            // 清理标记
+            window.__replay_pending_checked__ = false;
+            window.__replay_injected = false;
             
             // 停止回放器
             if (window.__replayer) {
@@ -937,6 +1034,7 @@ async function stopReplayInPage() {
   // 3. 重置侧边栏状态
   isReplaying = false;
   isReplayPaused = false;
+  stepResults = {};
   updateReplayButtons(false);
   
   var pb = document.getElementById('replayProgressBar');
@@ -1039,7 +1137,9 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
       
     case 'replayLog':
       // 只处理日志，不再额外添加
-      addReplayLogDirect(request.data.message, request.data.level);
+      var replayLogData = request.data || {};
+      var replayLogPrefix = replayLogData.stepNumber ? ('#' + replayLogData.stepNumber + ' ') : '';
+      addReplayLogDirect(replayLogPrefix + (replayLogData.message || ''), replayLogData.level);
       break;
   }
   sendResponse({ received: true });
@@ -1080,7 +1180,7 @@ function addReplayLogDirect(message, type) {
   
   // 限制日志数量
   var entries = logContent.querySelectorAll('.log-entry');
-  if (entries.length > 100) {
+  if (entries.length > 500) {
     entries[0].remove();
   }
 }
@@ -1091,7 +1191,15 @@ var _processedStepResults = {};
 
 function handleReplayStepResult(data) {
   var index = data.index;
-  var stepKey = 'step_' + index + '_' + data.success;
+  if (data.stepNumber != null) {
+    for (var replayIndex = 0; replayIndex < replaySteps.length; replayIndex++) {
+      if (replaySteps[replayIndex] && replaySteps[replayIndex].stepNumber === data.stepNumber) {
+        index = replayIndex;
+        break;
+      }
+    }
+  }
+  var stepKey = 'step_' + (data.stepNumber != null ? data.stepNumber : index) + '_' + data.success;
   
   // 防止重复处理
   if (_processedStepResults[stepKey]) {
@@ -1200,6 +1308,12 @@ function handleReplayStatus(data) {
 
     case 'completed':
       if (navigatingTimeout) clearTimeout(navigatingTimeout);
+      for (var completedIndex = 0; completedIndex < replaySteps.length; completedIndex++) {
+        if (!stepResults[completedIndex] || stepResults[completedIndex] === 'pending') {
+          stepResults[completedIndex] = 'success';
+        }
+      }
+      renderReplayList();
       if (pb) pb.style.width = '100%';
       if (cs) cs.innerHTML = '<span style="color:#34d399;">✅ 回放完成</span>';
       isReplaying = false;
