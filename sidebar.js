@@ -588,15 +588,43 @@ function closeExportDialog() { exportDialog.classList.add('hidden'); }
 async function confirmExport() {
   var fileName = fileNameInput.value.trim() || '录制_' + Date.now();
   fileName = fileName.replace(/[<>:"/\\|?*]/g, '_');
+
+  // 在导出时过滤掉中间输入步骤
+  var filteredSteps = [];
+  var lastInputKey = null;
+
+  // 需要先反转成正常顺序再处理
+  var reversedHistory = [].concat(actionHistory).reverse();
+
+  for (var i = 0; i < reversedHistory.length; i++) {
+    var action = reversedHistory[i];
+    
+    if (action.type === 'input') {
+      var inputKey = (action.target && (action.target.selector || action.target.id)) || '';
+      if (lastInputKey === inputKey && inputKey !== '') {
+        // 替换上一个输入步骤（只保留最后一个）
+        if (filteredSteps.length > 0) {
+          filteredSteps[filteredSteps.length - 1] = action;
+        }
+      } else {
+        filteredSteps.push(action);
+        lastInputKey = inputKey;
+      }
+    } else {
+      filteredSteps.push(action);
+      lastInputKey = null;
+    }
+  }
   
+  // 使用 filteredSteps
   var exportData = {
     name: fileName,
-    description: fileDescriptionInput.value.trim(),
+    description: fileDescriptionInput.value.trim() || '',
     exportTime: new Date().toISOString(),
-    totalSteps: actionHistory.length,
-    steps: actionHistory.map(function(action, i) {
+    totalSteps: filteredSteps.length,
+    steps: filteredSteps.map(function(action, i) {
       var obj = Object.assign({}, action);
-      obj.stepNumber = action.stepNumber || (actionHistory.length - i);
+      obj.stepNumber = i + 1;  // 重新编号，从1开始
       obj.stepName = action.stepName || null;
       return obj;
     })
@@ -614,7 +642,10 @@ async function confirmExport() {
     URL.revokeObjectURL(url);
     closeExportDialog();
     showToast('✅ 已导出: ' + fileName + '.json');
-  } catch (e) { showToast('导出失败'); }
+  } catch (e) {
+    console.error('导出失败:', e);
+    showToast('导出失败: ' + e.message);
+  }
 }
 
 async function clearHistory() {
@@ -747,6 +778,7 @@ function showReplayPanel(fileName, steps) {
 
 function closeReplayPanel() {
   stopReplayInPage();
+
   replaySteps = [];
   isReplaying = false;
   isReplayPaused = false;
@@ -791,36 +823,49 @@ async function startReplayInPage() {
       return;
     }
     
-    // ✅ 先清理所有旧的回放数据（新增）
+    // 1. 清理所有旧的回放数据（通过脚本注入）
+    // ✅ 彻底清理所有回放相关数据
+    console.log('========== 开始新回放，清理旧数据 ==========');
+
     try {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: function() {
+          // 清除所有存储
           sessionStorage.removeItem('__replay_remaining_steps__');
           sessionStorage.removeItem('__replay_speed__');
           sessionStorage.removeItem('__replay_current_index__');
           sessionStorage.removeItem('__replay_injected__');
+          localStorage.removeItem('__replay_global_stop__');
+          
+          // 重置所有标记
+          window.__replay_pending_checked__ = false;
+          window.__replay_injected = false;
+          
+          // 停止旧回放器
           if (window.__replayer) {
             window.__replayer.stop();
             window.__replayer = null;
           }
-          console.log('已清理旧的回放数据');
+          
+          console.log('旧回放数据已清理');
         }
       });
-      await new Promise(function(r) { setTimeout(r, 300); });
     } catch (e) {
       console.log('清理数据失败:', e);
     }
     
-    // 先停止之前的回放，清除残留状态
-    try {
-      await chrome.tabs.sendMessage(tab.id, { action: 'stopReplayScript' });
-      await new Promise(function(r) { setTimeout(r, 300); });
-    } catch (e) {}
+    // 等待清理完成
+    await new Promise(function(r) { setTimeout(r, 500); });
     
     // 排序步骤
     replaySteps.sort(function(a, b) {
       return (a.stepNumber || 0) - (b.stepNumber || 0);
+    });
+    
+    // 重新编号
+    replaySteps.forEach(function(step, idx) {
+      step.stepNumber = idx + 1;
     });
     
     stepResults = {};
@@ -835,23 +880,30 @@ async function startReplayInPage() {
     
     // 注入回放脚本
     try {
+      console.log('注入 replay-inject.js...');
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         files: ['replay-inject.js']
       });
-      await new Promise(function(r) { setTimeout(r, 500); });
+      await new Promise(function(r) { setTimeout(r, 800); });
+      console.log('注入完成');
     } catch (e) {
-      console.log('脚本注入:', e);
+      console.error('脚本注入失败:', e);
+      addReplayLog('❌ 脚本注入失败: ' + e.message, 'error');
+      showToast('脚本注入失败，请刷新页面重试');
+      return;
     }
     
     // 发送回放指令
-    var response = await chrome.tabs.sendMessage(tab.id, { 
-      action: 'startReplayScript', 
+    var response = await chrome.tabs.sendMessage(tab.id, {
+      action: 'startReplayScript',
       steps: replaySteps,
-      speed: replaySpeed, 
-      highlight: true, 
-      fromIndex: 0 
+      speed: replaySpeed,
+      highlight: true,
+      fromIndex: 0
     });
+    
+    console.log('回放启动响应:', response);
     
     if (response && response.success) {
       isReplaying = true;
@@ -888,10 +940,6 @@ async function stopReplayInPage() {
   var tab = await getCurrentTab();
   
   // ✅ 设置全局停止标志（防止新页面自动恢复回放）
-  localStorage.setItem('__replay_global_stop__', 'true');
-  setTimeout(function() {
-    localStorage.removeItem('__replay_global_stop__');
-  }, 3000);
   
   // 1. 发送停止消息到当前页面
   if (tab && tab.id) {
@@ -911,11 +959,19 @@ async function stopReplayInPage() {
         await chrome.scripting.executeScript({
           target: { tabId: allTabs[i].id },
           func: function() {
+            localStorage.setItem('__replay_global_stop__', 'true');
+            setTimeout(function() {
+              localStorage.removeItem('__replay_global_stop__');
+            }, 3000);
             // 清除回放相关的存储
             sessionStorage.removeItem('__replay_remaining_steps__');
             sessionStorage.removeItem('__replay_speed__');
             sessionStorage.removeItem('__replay_current_index__');
             sessionStorage.removeItem('__replay_injected__');
+            
+            // 清理标记
+            window.__replay_pending_checked__ = false;
+            window.__replay_injected = false;
             
             // 停止回放器
             if (window.__replayer) {
@@ -937,6 +993,7 @@ async function stopReplayInPage() {
   // 3. 重置侧边栏状态
   isReplaying = false;
   isReplayPaused = false;
+  stepResults = {};
   updateReplayButtons(false);
   
   var pb = document.getElementById('replayProgressBar');

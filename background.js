@@ -6,6 +6,34 @@ var isRecording = false;
 var currentTabId = null;
 var recordedTabs = new Set();
 var autoSaveFileName = '';
+var stateReady = loadPersistedState();
+
+async function loadPersistedState() {
+  try {
+    var data = await chrome.storage.local.get([
+      'sessions',
+      'currentSessionId',
+      'isRecording',
+      'currentTabId',
+      'currentFileName'
+    ]);
+    recordingSessions = data.sessions || {};
+    currentSessionId = data.currentSessionId || null;
+    isRecording = data.isRecording === true;
+    currentTabId = data.currentTabId || null;
+    autoSaveFileName = data.currentFileName || '';
+    if (currentSessionId) {
+      var sessionKey = 'session_' + currentSessionId;
+      var sessionData = await chrome.storage.local.get([sessionKey]);
+      if (sessionData[sessionKey]) {
+        recordingSessions[currentSessionId] = sessionData[sessionKey];
+      }
+    }
+    recordedTabs = new Set(currentTabId ? [currentTabId] : []);
+  } catch (e) {
+    console.warn('Failed to restore recording state:', e);
+  }
+}
 
 function generateSessionId() {
   return 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
@@ -39,6 +67,11 @@ function generateFileName(url, title) {
   return shortName + '_' + dateStr + '.json';
 }
 
+function normalizeJsonFileName(fileName) {
+  fileName = (fileName || 'recording').replace(/[<>:"/\\|?*]/g, '_');
+  return fileName.replace(/\.json$/i, '') + '.json';
+}
+
 // 初始化
 chrome.runtime.onInstalled.addListener(async function() {
   console.log('浏览器操作追踪器 v4.2 已安装');
@@ -60,6 +93,12 @@ chrome.action.onClicked.addListener(function(tab) {
 // 确保content script在标签页中运行
 async function ensureContentScriptInjected(tabId) {
   if (recordedTabs.has(tabId)) return true;
+
+  try {
+    await chrome.tabs.sendMessage(tabId, { action: 'getCurrentInfo' });
+    recordedTabs.add(tabId);
+    return true;
+  } catch (e) {}
   
   try {
     await chrome.scripting.executeScript({
@@ -71,9 +110,18 @@ async function ensureContentScriptInjected(tabId) {
     return true;
   } catch (e) {
     console.log('注入content script:', e.message);
-    recordedTabs.add(tabId);
-    return true;
+    return false;
   }
+}
+
+async function setTabRecordingStatus(tabId, recording) {
+  if (!tabId) return;
+  try {
+    var ready = await ensureContentScriptInjected(tabId);
+    if (ready) {
+      await chrome.tabs.sendMessage(tabId, { action: 'updateRecordingStatus', isRecording: recording });
+    }
+  } catch (e) {}
 }
 
 // 保存会话数据到本地存储
@@ -85,12 +133,11 @@ async function saveSessionToStorage(sessionId) {
 
 // 开始录制
 async function startRecording(url, title, tabId) {
+  await stateReady;
   currentSessionId = generateSessionId();
   isRecording = true;
   currentTabId = tabId;
   recordedTabs = new Set();
-  
-  if (tabId) recordedTabs.add(tabId);
   
   autoSaveFileName = generateFileName(url, title);
   
@@ -119,19 +166,25 @@ async function startRecording(url, title, tabId) {
   
   console.log('开始录制:', currentSessionId, '文件:', autoSaveFileName);
   
+  await setTabRecordingStatus(tabId, true);
   return { sessionId: currentSessionId, fileName: autoSaveFileName };
 }
 
 // 停止录制
 async function stopRecording() {
+  await stateReady;
   if (!currentSessionId || !recordingSessions[currentSessionId]) return null;
   
   recordingSessions[currentSessionId].endTime = new Date().toISOString();
   isRecording = false;
   var sessionId = currentSessionId;
   var session = Object.assign({}, recordingSessions[currentSessionId]);
+  var tabsToStop = Array.from(recordedTabs);
   
   await saveSessionToStorage(sessionId);
+  await Promise.all(tabsToStop.map(function(tabId) {
+    return setTabRecordingStatus(tabId, false);
+  }));
   
   currentSessionId = null;
   currentTabId = null;
@@ -163,8 +216,10 @@ async function updateWindowInfo(windowInfo) {
 
 // 记录标签页切换
 async function recordTabSwitch(fromTabId, toTabId, url, title) {
+  await stateReady;
   if (!isRecording || !currentSessionId) return;
   
+  await setTabRecordingStatus(fromTabId, false);
   currentTabId = toTabId;
   await ensureContentScriptInjected(toTabId);
   
@@ -188,9 +243,7 @@ async function recordTabSwitch(fromTabId, toTabId, url, title) {
     currentTabId: currentTabId 
   });
   
-  try {
-    await chrome.tabs.sendMessage(toTabId, { action: 'updateRecordingStatus', isRecording: true });
-  } catch (e) {}
+  await setTabRecordingStatus(toTabId, true);
   
   chrome.runtime.sendMessage({
     type: 'tabSwitched',
@@ -200,6 +253,7 @@ async function recordTabSwitch(fromTabId, toTabId, url, title) {
 
 // 记录URL变化
 async function recordUrlChange(tabId, url, title) {
+  await stateReady;
   if (!isRecording || !currentSessionId) return;
   if (currentTabId !== tabId) return;
   
@@ -215,13 +269,16 @@ async function recordUrlChange(tabId, url, title) {
 }
 
 // 记录操作
-async function recordAction(action) {
+async function recordAction(action, senderTabId) {
+  await stateReady;
+  if (!isRecording || !currentSessionId || !recordingSessions[currentSessionId]) return;
+  if (senderTabId && currentTabId && senderTabId !== currentTabId) return;
   console.log('记录操作:', action.type, action.target ? action.target.tagName : '');
   
   var storageData = await chrome.storage.local.get(['actionHistory']);
   var actionHistory = storageData.actionHistory || [];
   
-  action.tabId = currentTabId;
+  action.tabId = senderTabId || currentTabId;
   
   if (action.type === 'navigation') {
     if (!action.url && recordingSessions[currentSessionId]) {
@@ -257,9 +314,7 @@ async function recordAction(action) {
     
     recordingSessions[currentSessionId].actions.push(Object.assign({}, action, { timeOffset: timeOffset }));
     
-    if (recordingSessions[currentSessionId].actions.length % 5 === 0) {
-      await saveSessionToStorage(currentSessionId);
-    }
+    await saveSessionToStorage(currentSessionId);
   }
 }
 
@@ -274,7 +329,7 @@ async function exportSessionToFile(sessionId, customName) {
     session = data[key];
   }
   
-  var fileName = (customName || session.fileName || 'recording').replace(/[<>:"/\\|?*]/g, '_');
+  var fileName = normalizeJsonFileName(customName || session.fileName || 'recording');
   
   var exportData = {
     sessionId: session.id,
@@ -295,7 +350,7 @@ async function exportSessionToFile(sessionId, customName) {
   try {
     await chrome.downloads.download({
       url: dataUrl,
-      filename: 'recordings/' + fileName + '.json',
+      filename: 'recordings/' + fileName,
       saveAs: false
     });
     console.log('导出成功:', fileName);
@@ -310,13 +365,28 @@ async function exportSessionToFile(sessionId, customName) {
 chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
   (async function() {
     try {
+      await stateReady;
       switch (request.type) {
         case 'injectReplayScript':
-          // 获取当前活动标签页
           var activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
           var activeTab = activeTabs[0];
           if (activeTab && activeTab.id) {
             try {
+              // 先检查是否已经注入
+              var checkResult = await chrome.scripting.executeScript({
+                target: { tabId: activeTab.id },
+                func: function() {
+                  return window.__replay_injected === true;
+                }
+              });
+              
+              if (checkResult && checkResult[0] && checkResult[0].result) {
+                console.log('replay-inject.js 已存在，无需重复注入');
+                sendResponse({ success: true, alreadyInjected: true });
+                break;
+              }
+              
+              // 注入脚本
               await chrome.scripting.executeScript({
                 target: { tabId: activeTab.id },
                 files: ['replay-inject.js']
@@ -344,7 +414,7 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
           break;
           
         case 'recordAction':
-          await recordAction(request.data);
+          await recordAction(request.data, sender.tab ? sender.tab.id : null);
           sendResponse({ success: true });
           break;
           

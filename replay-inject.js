@@ -1,8 +1,11 @@
-// replay-inject.js - 负责在页面中执行回放步骤，提供回放控制和状态反馈功能
 (function() {
   'use strict';
 
-  console.log('replay-inject.js 初始化...');
+  console.log('========== replay-inject.js 已加载 ==========');
+  console.log('当前页面URL:', window.location.href);
+
+  // 标记已注入
+  window.__replay_injected = true;
 
   var __lastMessageTime = {};
 
@@ -11,8 +14,8 @@
     var messageKey = key || (type + '_' + (data.step || data.index || ''));
     if (__lastMessageTime[messageKey] && now - __lastMessageTime[messageKey] < 300) return;
     __lastMessageTime[messageKey] = now;
-    try { 
-      chrome.runtime.sendMessage({ type: type, data: data }); 
+    try {
+      chrome.runtime.sendMessage({ type: type, data: data });
     } catch (e) {}
   }
 
@@ -55,8 +58,22 @@
     }
     var target = step.target;
     var element = null;
-    
-    // 通过文本查找
+
+    if (target.id) {
+      element = document.getElementById(target.id);
+      if (element) return element;
+    }
+    if (target.name) {
+      var namedElements = document.getElementsByName(target.name);
+      if (namedElements.length > 0) return namedElements[0];
+    }
+    if (target.selector) {
+      try {
+        element = document.querySelector(target.selector);
+        if (element) return element;
+      } catch (e) {}
+    }
+
     if (target.textContent && target.textContent.trim().length > 0) {
       var searchText = target.textContent.trim();
       var allElements = document.querySelectorAll('span, div, button, a');
@@ -69,7 +86,7 @@
         }
       }
     }
-    
+
     if (target.id) {
       element = document.getElementById(target.id);
       if (element) return element;
@@ -108,7 +125,7 @@
     try {
       var url = step.url || step.pageUrl;
       if (!url) return false;
-      
+
       var currentUrl = window.location.href;
       var isSamePage = false;
       try {
@@ -118,14 +135,14 @@
       } catch (e) {
         isSamePage = (currentUrl.indexOf(url) === 0 || url.indexOf(currentUrl) === 0);
       }
-      
+
       if (isSamePage) return true;
-      
+
       var remainingSteps = [];
       for (var i = this.currentIndex + 1; i < this.steps.length; i++) {
         remainingSteps.push(this.steps[i]);
       }
-      
+
       if (remainingSteps.length > 0) {
         sessionStorage.setItem('__replay_remaining_steps__', JSON.stringify({
           steps: remainingSteps,
@@ -138,7 +155,7 @@
         sessionStorage.removeItem('__replay_remaining_steps__');
         sendUniqueMessage('replayStatus', { status: 'completed', total: this.steps.length }, 'complete');
       }
-      
+
       sendUniqueMessage('replayStatus', { status: 'navigating', url: url }, 'nav');
       window.location.href = url;
       return true;
@@ -220,6 +237,12 @@
       var rect = element.getBoundingClientRect();
       var centerX = rect.left + rect.width / 2;
       var centerY = rect.top + rect.height / 2;
+      if (step.target && step.target.clickOffsetX != null && step.target.clickOffsetY != null) {
+        centerX = rect.left + Math.max(0, Math.min(rect.width, step.target.clickOffsetX));
+        centerY = rect.top + Math.max(0, Math.min(rect.height, step.target.clickOffsetY));
+      }
+      element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: centerX, clientY: centerY, view: window }));
+      element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: centerX, clientY: centerY, view: window }));
       element.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: centerX, clientY: centerY, view: window }));
       element.click();
       this.createHighlight(centerX, centerY);
@@ -272,7 +295,7 @@
         return;
       }
       if (!step.stepNumber) step.stepNumber = index + 1;
-      
+
       setTimeout(async function() {
         var startTime = Date.now();
         var success = false;
@@ -294,16 +317,16 @@
           console.error('步骤执行异常:', error);
         }
         var duration = Date.now() - startTime;
-        
+
         sendUniqueMessage('replayStepResult', {
           index: index,
           stepNumber: step.stepNumber,
           success: success,
           duration: duration
         }, 'result_' + index);
-        
+
         console.log('步骤 #' + step.stepNumber + ' 执行' + (success ? '成功' : '失败') + ' 耗时:' + duration + 'ms');
-        
+
         var delay = (step.type === 'navigation') ? 1500 : 400;
         setTimeout(function() { resolve(success); }, delay);
       }, 300);
@@ -323,38 +346,38 @@
     fromIndex = fromIndex || 0;
     if (this.isReplaying && !this.isPaused) return;
     if (this.isPaused) this.isPaused = false;
-    
+
     this.isReplaying = true;
     this.currentIndex = fromIndex;
     this.sendStatus('started', fromIndex + 1);
-    
+
     if (this.steps.length > 0 && fromIndex < this.steps.length) {
       this.sendStatus('executing', fromIndex + 1, this.steps[fromIndex]);
     }
-    
+
     for (var i = fromIndex; i < this.steps.length; i++) {
       while (this.isPaused && this.isReplaying) {
         await new Promise(function(r) { setTimeout(r, 100); });
       }
       if (!this.isReplaying) break;
-      
+
       this.currentIndex = i;
       var step = this.steps[i];
       if (!step.stepNumber) step.stepNumber = i + 1;
-      
+
       this.sendStatus('executing', i + 1, step);
       await this.executeStep(step, i);
-      
+
       if (step.type !== 'navigation') {
         await new Promise(function(r) { setTimeout(r, 800 / this.speed); }.bind(this));
       } else {
         await new Promise(function(r) { setTimeout(r, 1500); });
       }
     }
-    
+
     this.isReplaying = false;
     this.isPaused = false;
-    
+
     if (this.currentIndex >= this.steps.length - 1) {
       this.sendStatus('completed', this.steps.length);
       console.log('========== 回放完成 ==========');
@@ -383,7 +406,6 @@
     this.sendStatus('stopped');
   };
 
-  // 消息监听
   chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
     try {
       switch (request.action) {
@@ -417,109 +439,115 @@
     return true;
   });
 
-  // 跨页面恢复
-  (function checkPendingReplay() {
-    if (window.__replay_pending_checked__) return;
-    window.__replay_pending_checked__ = true;
-    
-    // 检查全局停止标志
-    try {
-      var globalStop = localStorage.getItem('__replay_global_stop__');
-      if (globalStop === 'true') {
-        console.log('全局停止标志存在，跳过恢复回放');
-        sessionStorage.removeItem('__replay_remaining_steps__');
-        return;
-      }
-    } catch (e) {}
-    
-    var pendingData = sessionStorage.getItem('__replay_remaining_steps__');
-    if (!pendingData) return;
-    
-    try {
-      var data = JSON.parse(pendingData);
-      var steps = data.steps || [];
-      var speed = data.speed || 1;
-      
+// 每次页面加载都重置检查标记
+window.__replay_pending_checked__ = false;
+console.log('重置 checkPendingReplay 标记');
+
+(function checkPendingReplay() {
+  console.log('checkPendingReplay 开始执行');
+  
+  // 检查全局停止标志
+  try {
+    var globalStop = localStorage.getItem('__replay_global_stop__');
+    if (globalStop === 'true') {
+      console.log('全局停止标志存在，跳过恢复回放');
       sessionStorage.removeItem('__replay_remaining_steps__');
-      
-      if (steps.length === 0) return;
-      
-      // 过滤已执行的导航步骤
-      var currentUrl = window.location.href;
-      var filteredSteps = [];
-      for (var i = 0; i < steps.length; i++) {
-        var step = steps[i];
-        if (step.type === 'navigation') {
-          var targetUrl = step.url || '';
-          var skip = false;
-          try {
-            var currentBase = new URL(currentUrl).origin + new URL(currentUrl).pathname;
-            var targetBase = new URL(targetUrl, currentUrl).origin + new URL(targetUrl, currentUrl).pathname;
-            skip = (currentBase === targetBase);
-          } catch (e) {
-            skip = (currentUrl.indexOf(targetUrl) === 0);
-          }
-          if (skip) {
-            console.log('跳过已加载的导航步骤:', targetUrl);
-            continue;
-          }
-        }
-        filteredSteps.push(step);
-      }
-      
-      if (filteredSteps.length === 0) {
-        sendUniqueMessage('replayStatus', { status: 'completed', total: data.totalSteps || steps.length }, 'complete_pending');
-        return;
-      }
-      
-      // 重新编号
-      filteredSteps.forEach(function(s, idx) {
-        s.stepNumber = (s.stepNumber || 1) + idx;
-      });
-      
-      var waitForPageLoad = function() {
-        if (document.readyState === 'complete') {
-          console.log('页面已完全加载，开始恢复回放，剩余步骤:', filteredSteps.length);
-          
-          if (window.__replayer) {
-            window.__replayer.stop();
-            window.__replayer = null;
-          }
-          
-          var replayer = new ActionReplayer(filteredSteps);
-          replayer.speed = speed;
-          replayer.highlightEnabled = true;
-          window.__replayer = replayer;
-          
-          sendUniqueMessage('replayStatus', { 
-            status: 'resumed', 
-            step: filteredSteps[0] ? filteredSteps[0].stepNumber : 1, 
-            total: data.totalSteps || filteredSteps.length 
-          }, 'resumed');
-          
-          if (filteredSteps.length > 0) {
-            sendUniqueMessage('replayStatus', { 
-              status: 'executing', 
-              step: filteredSteps[0].stepNumber, 
-              total: data.totalSteps || filteredSteps.length,
-              type: filteredSteps[0].type
-            }, 'first_executing');
-          }
-          
-          setTimeout(function() {
-            replayer.startReplay(0);
-          }, 500);
-        } else {
-          setTimeout(waitForPageLoad, 200);
-        }
-      };
-      
-      setTimeout(waitForPageLoad, 500);
-    } catch (e) {
-      console.error('恢复回放失败:', e);
-      sessionStorage.removeItem('__replay_remaining_steps__');
+      return;
     }
-  })();
+  } catch (e) {}
+  
+  var pendingData = sessionStorage.getItem('__replay_remaining_steps__');
+  if (!pendingData) {
+    console.log('没有待回放的步骤');
+    return;
+  }
+  
+  console.log('发现待回放步骤:', pendingData.substring(0, 200));
+  
+  try {
+    var data = JSON.parse(pendingData);
+    var steps = data.steps || [];
+    var speed = data.speed || 1;
+    
+    console.log('待回放步骤数量:', steps.length);
+    
+    // ✅ 关键修复：立即清除，防止重复
+    sessionStorage.removeItem('__replay_remaining_steps__');
+    
+    if (steps.length === 0) {
+      console.log('剩余步骤为空');
+      return;
+    }
+    
+    // 过滤已执行的导航步骤
+    var currentUrl = window.location.href;
+    var filteredSteps = [];
+    
+    for (var i = 0; i < steps.length; i++) {
+      var step = steps[i];
+      if (step.type === 'navigation') {
+        var targetUrl = step.url || '';
+        var skip = false;
+        try {
+          var currentBase = new URL(currentUrl).origin + new URL(currentUrl).pathname;
+          var targetBase = new URL(targetUrl, currentUrl).origin + new URL(targetUrl, currentUrl).pathname;
+          skip = (currentBase === targetBase);
+        } catch (e) {
+          skip = (currentUrl.indexOf(targetUrl) === 0);
+        }
+        if (skip) {
+          console.log('跳过已加载的导航步骤:', targetUrl);
+          continue;
+        }
+      }
+      filteredSteps.push(step);
+    }
+    
+    console.log('过滤后步骤数量:', filteredSteps.length);
+    
+    if (filteredSteps.length === 0) {
+      console.log('所有步骤都已执行，发送完成');
+      sendUniqueMessage('replayStatus', { status: 'completed', total: data.totalSteps || steps.length }, 'complete_pending');
+      return;
+    }
+    
+    // 重新编号
+    for (var i = 0; i < filteredSteps.length; i++) {
+      filteredSteps[i].stepNumber = i + 1;
+    }
+    
+    // 延迟执行，确保页面稳定
+    setTimeout(function() {
+      console.log('开始恢复回放，执行步骤:', filteredSteps.length);
+      
+      if (window.__replayer) {
+        window.__replayer.stop();
+        window.__replayer = null;
+      }
+      
+      var replayer = new ActionReplayer(filteredSteps);
+      replayer.speed = speed;
+      replayer.highlightEnabled = true;
+      window.__replayer = replayer;
+      
+      // 发送恢复状态
+      sendUniqueMessage('replayStatus', {
+        status: 'resumed',
+        step: 1,
+        total: filteredSteps.length
+      }, 'resumed');
+      
+      // 开始回放
+      setTimeout(function() {
+        replayer.startReplay(0);
+      }, 500);
+    }, 1000);
+    
+  } catch (e) {
+    console.error('恢复回放失败:', e);
+    sessionStorage.removeItem('__replay_remaining_steps__');
+  }
+})();
 
   console.log('replay-inject.js 加载完成');
 })();
