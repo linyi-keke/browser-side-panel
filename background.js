@@ -6,6 +6,7 @@ var isRecording = false;
 var currentTabId = null;
 var recordedTabs = new Set();
 var autoSaveFileName = '';
+var PENDING_REPLAY_KEY = '__replay_pending_data__';
 var stateReady = loadPersistedState();
 
 async function loadPersistedState() {
@@ -429,7 +430,22 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
           chrome.runtime.sendMessage({ type: request.type, data: request.data }).catch(function() {});
           sendResponse({ success: true });
           break;
-          
+
+        case 'savePendingReplay':
+          await chrome.storage.local.set({ [PENDING_REPLAY_KEY]: request.data || null });
+          sendResponse({ success: true });
+          break;
+
+        case 'getPendingReplay':
+          var pendingReplayData = await chrome.storage.local.get([PENDING_REPLAY_KEY]);
+          sendResponse({ success: true, data: pendingReplayData[PENDING_REPLAY_KEY] || null });
+          break;
+
+        case 'clearPendingReplay':
+          await chrome.storage.local.remove([PENDING_REPLAY_KEY]);
+          sendResponse({ success: true });
+          break;
+
         case 'getRecordingStatus':
           sendResponse({ isRecording: isRecording, currentSessionId: currentSessionId, currentTabId: currentTabId });
           break;
@@ -529,6 +545,7 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
 
         case 'globalStopReplay':
           // 停止所有标签页的回放
+          await chrome.storage.local.remove([PENDING_REPLAY_KEY]);
           var allTabs = await chrome.tabs.query({});
           for (var i = 0; i < allTabs.length; i++) {
             try {
@@ -613,14 +630,9 @@ chrome.webNavigation.onCompleted.addListener(async function(details) {
   
   // 检查是否有待回放的步骤
   try {
-    var result = await chrome.scripting.executeScript({
-      target: { tabId: details.tabId },
-      func: function() {
-        return sessionStorage.getItem('__replay_remaining_steps__');
-      }
-    });
+    var result = await chrome.storage.local.get([PENDING_REPLAY_KEY]);
     
-    if (result && result[0] && result[0].result) {
+    if (result && result[PENDING_REPLAY_KEY]) {
       console.log('检测到待回放步骤，注入回放脚本:', details.tabId);
       
       // 注入回放脚本

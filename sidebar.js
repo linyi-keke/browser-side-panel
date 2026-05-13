@@ -867,6 +867,7 @@ async function startReplayInPage() {
     // 1. 清理所有旧的回放数据（通过脚本注入）
     // ✅ 彻底清理所有回放相关数据
     console.log('========== 开始新回放，清理旧数据 ==========');
+    await chrome.runtime.sendMessage({ type: 'clearPendingReplay' }).catch(function() {});
 
     try {
       await chrome.scripting.executeScript({
@@ -1348,11 +1349,7 @@ function handleReplayStatus(data) {
     case 'navigating':
       if (cs) cs.innerHTML = '<span style="color:#f59e0b;">🔄 正在跳转页面...</span>';
       addReplayLog('🔄 页面跳转中...', 'navigate');
-      // ✅ 设置5秒超时，如果还没收到完成状态，检查是否真的完成了
-      navigatingTimeout = setTimeout(function() {
-        console.log('导航超时，检查回放是否完成');
-        checkReplayCompletion();
-      }, 5000);
+      console.log('等待新页面加载并恢复回放');
       break;
       
     case 'stopped':
@@ -1397,6 +1394,7 @@ function checkReplayCompletion() {
 
 // ✅ 新增：清理回放存储
 function clearReplayStorage() {
+  chrome.runtime.sendMessage({ type: 'clearPendingReplay' }).catch(function() {});
   chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
     if (tabs[0] && tabs[0].id) {
       chrome.scripting.executeScript({

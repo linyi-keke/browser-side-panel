@@ -508,8 +508,9 @@ window.addEventListener('beforeunload', function() {
 })();
 
 // 检查是否有待回放的回放步骤
-(function checkAndInjectReplay() {
-  var pendingData = sessionStorage.getItem('__replay_remaining_steps__');
+(async function checkAndInjectReplay() {
+  var response = await chrome.runtime.sendMessage({ type: 'getPendingReplay' }).catch(function() { return null; });
+  var pendingData = response && response.data;
   if (pendingData) {
     console.log('检测到待回放步骤，请求 background 注入回放脚本');
     

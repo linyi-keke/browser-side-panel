@@ -8,6 +8,7 @@
   window.__replay_injected = true;
 
   var __lastMessageTime = {};
+  var PENDING_REPLAY_KEY = '__replay_pending_data__';
 
   function sendUniqueMessage(type, data, key) {
     var now = Date.now();
@@ -33,6 +34,19 @@
         }
       });
     } catch (e) {}
+  }
+
+  function savePendingReplay(data) {
+    return chrome.storage.local.set({ [PENDING_REPLAY_KEY]: data || null });
+  }
+
+  async function getPendingReplay() {
+    var data = await chrome.storage.local.get([PENDING_REPLAY_KEY]);
+    return data[PENDING_REPLAY_KEY] || null;
+  }
+
+  function clearPendingReplay() {
+    return chrome.storage.local.remove([PENDING_REPLAY_KEY]);
   }
 
   function describeTarget(step) {
@@ -92,95 +106,152 @@
     return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
   };
 
+  ActionReplayer.prototype.normalizeText = function(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  };
+
+  ActionReplayer.prototype.getExpectedPoint = function(step) {
+    if (!step || step.x === undefined || step.y === undefined) return null;
+    var scaleX = step.viewportWidth ? (window.innerWidth / step.viewportWidth) : 1;
+    var scaleY = step.viewportHeight ? (window.innerHeight / step.viewportHeight) : 1;
+    return {
+      x: Math.max(0, Math.min(window.innerWidth - 1, step.x * scaleX)),
+      y: Math.max(0, Math.min(window.innerHeight - 1, step.y * scaleY))
+    };
+  };
+
+  ActionReplayer.prototype.findBestCandidate = function(candidates, step, source) {
+    var expectedText = step && step.target ? this.normalizeText(step.target.textContent) : '';
+    var expectedPoint = this.getExpectedPoint(step);
+    var best = null;
+    var bestScore = -Infinity;
+    for (var i = 0; i < candidates.length; i++) {
+      var el = candidates[i];
+      if (!el || el === document.body || el === document.documentElement) continue;
+      var rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+      if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+      var score = source === 'selector' ? 80 : 0;
+      var text = this.normalizeText(el.textContent || el.value || '');
+      if (expectedText) {
+        if (text === expectedText) score += 1000;
+        else if (text.indexOf(expectedText) >= 0) score += 500;
+        else continue;
+      }
+      if (expectedPoint) {
+        if (expectedPoint.x >= rect.left && expectedPoint.x <= rect.right && expectedPoint.y >= rect.top && expectedPoint.y <= rect.bottom) score += 250;
+        var dx = rect.left + rect.width / 2 - expectedPoint.x;
+        var dy = rect.top + rect.height / 2 - expectedPoint.y;
+        score += Math.max(0, 200 - Math.sqrt(dx * dx + dy * dy));
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    }
+    if (best && bestScore > -500) {
+      this.log('Best ' + source + ' candidate: ' + describeElement(best) + ', score=' + Math.round(bestScore), 'info', step);
+      return best;
+    }
+    return null;
+  };
+
+  ActionReplayer.prototype.urlMatchesStep = function(step) {
+    if (!step || !step.pageUrl) return true;
+    try {
+      var current = new URL(window.location.href);
+      var expected = new URL(step.pageUrl, window.location.href);
+      return current.origin === expected.origin && current.pathname === expected.pathname;
+    } catch (e) {
+      return true;
+    }
+  };
+
+  ActionReplayer.prototype.waitForStepPage = async function(step, timeoutMs) {
+    if (!step || !step.pageUrl || step.type === 'navigation') return true;
+    var start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (this.urlMatchesStep(step)) return true;
+      await new Promise(function(r) { setTimeout(r, 250); });
+    }
+    this.log('Page URL still differs from recorded step: current=' + window.location.href + ', recorded=' + step.pageUrl, 'info', step);
+    return false;
+  };
+
+  ActionReplayer.prototype.waitForElement = async function(step, timeoutMs) {
+    var start = Date.now();
+    var element = null;
+    while (Date.now() - start < timeoutMs) {
+      element = this.findElement(step);
+      if (element) return element;
+      await new Promise(function(r) { setTimeout(r, 300); });
+    }
+    return this.findElement(step);
+  };
+
   ActionReplayer.prototype.findElement = function(step) {
-    this.log('定位元素: ' + describeTarget(step), 'info', step);
+    this.log('Locate element: ' + describeTarget(step), 'info', step);
+    var expectedPoint = this.getExpectedPoint(step);
     if (!step || !step.target) {
       if (step && step.x !== undefined && step.y !== undefined) {
-        var pointElement = document.elementFromPoint(step.x, step.y);
-        this.log('无 target，按坐标 (' + step.x + ', ' + step.y + ') 命中: ' + describeElement(pointElement), pointElement ? 'info' : 'fail', step);
-        return pointElement;
+        return document.elementFromPoint(expectedPoint ? expectedPoint.x : step.x, expectedPoint ? expectedPoint.y : step.y);
       }
-      this.log('定位失败: 缺少 target 和坐标', 'fail', step);
+      this.log('Locate failed: missing target and coordinates', 'fail', step);
       return null;
     }
     var target = step.target;
     var element = null;
-
     if (target.id) {
       element = document.getElementById(target.id);
       if (element) {
-        this.log('通过 id 找到元素: ' + describeElement(element), 'info', step);
-        return element;
+        if (!target.textContent || this.normalizeText(element.textContent || element.value || '').indexOf(this.normalizeText(target.textContent)) >= 0) return element;
       }
-      this.log('通过 id 未找到元素: #' + target.id, 'fail', step);
     }
     if (target.name) {
-      var namedElements = document.getElementsByName(target.name);
-      if (namedElements.length > 0) {
-        this.log('通过 name 找到元素: ' + describeElement(namedElements[0]), 'info', step);
-        return namedElements[0];
-      }
-      this.log('通过 name 未找到元素: ' + target.name, 'fail', step);
+      element = this.findBestCandidate(Array.prototype.slice.call(document.getElementsByName(target.name)), step, 'name');
+      if (element) return element;
     }
     if (target.selector) {
       try {
-        element = document.querySelector(target.selector);
+        element = this.findBestCandidate(Array.prototype.slice.call(document.querySelectorAll(target.selector)), step, 'selector');
         if (element) {
-          this.log('通过 selector 找到元素: ' + describeElement(element), 'info', step);
+          this.log('Matched by selector + text/coordinate: ' + describeElement(element), 'info', step);
           return element;
         }
-        this.log('通过 selector 未找到元素: ' + target.selector, 'fail', step);
+        this.log('Selector had no text/coordinate match: ' + target.selector, 'fail', step);
       } catch (e) {
-        this.log('selector 无效: ' + target.selector + '，错误: ' + e.message, 'fail', step);
+        this.log('Invalid selector: ' + target.selector + ', error=' + e.message, 'fail', step);
       }
     }
-
     if (target.textContent && target.textContent.trim().length > 0) {
-      var searchText = target.textContent.trim();
-      var allElements = document.querySelectorAll('span, div, button, a');
+      var searchText = this.normalizeText(target.textContent);
+      var textSelector = target.tagName ? target.tagName.toLowerCase() + ', span, div, button, a, yt-formatted-string' : 'span, div, button, a, yt-formatted-string';
+      var allElements = Array.prototype.slice.call(document.querySelectorAll(textSelector));
+      var textMatches = [];
       for (var i = 0; i < allElements.length; i++) {
         var el = allElements[i];
-        var elText = (el.textContent || '').trim();
-        if (elText === searchText) {
-          console.log('通过文本找到元素:', searchText);
-          return el;
+        if (this.normalizeText(el.textContent || el.value || '') === searchText) {
+          textMatches.push(el);
         }
       }
-    }
-
-    if (target.id) {
-      element = document.getElementById(target.id);
-      if (element) {
-        this.log('第二次 id 检查找到元素: ' + describeElement(element), 'info', step);
-        return element;
-      }
-    }
-    if (target.name) {
-      var elements = document.getElementsByName(target.name);
-      if (elements.length > 0) {
-        this.log('第二次 name 检查找到元素: ' + describeElement(elements[0]), 'info', step);
-        return elements[0];
-      }
-    }
-    if (target.selector) {
-      try {
-        element = document.querySelector(target.selector);
-        if (element) {
-          this.log('第二次 selector 检查找到元素: ' + describeElement(element), 'info', step);
-          return element;
-        }
-      } catch (e) {}
+      element = this.findBestCandidate(textMatches, step, 'text');
+      if (element) return element;
     }
     if (step.x !== undefined && step.y !== undefined) {
-      element = document.elementFromPoint(step.x, step.y);
+      element = document.elementFromPoint(expectedPoint ? expectedPoint.x : step.x, expectedPoint ? expectedPoint.y : step.y);
       this.log('Coordinate fallback hit: ' + describeElement(element), element ? 'info' : 'fail', step);
       if (element && element !== document.body) {
-        this.log('坐标兜底命中元素: ' + describeElement(element), 'info', step);
+        if (target.textContent) {
+          var expectedText = this.normalizeText(target.textContent);
+          var actualText = this.normalizeText(element.textContent || element.value || '');
+          if (actualText && actualText !== expectedText && actualText.indexOf(expectedText) < 0) {
+            this.log('Coordinate text mismatch; refusing click: ' + actualText, 'fail', step);
+            return null;
+          }
+        }
         return element;
       }
-      this.log('坐标兜底未命中有效元素: (' + step.x + ', ' + step.y + ')', 'fail', step);
     }
-    this.log('定位失败: 所有策略均未找到元素', 'fail', step);
+    this.log('Locate failed: no element matched both text and coordinates', 'fail', step);
     return null;
   };
 
@@ -232,19 +303,20 @@
       }
 
       if (remainingSteps.length > 0) {
-        sessionStorage.setItem('__replay_remaining_steps__', JSON.stringify({
+        await savePendingReplay({
           steps: remainingSteps,
           speed: this.speed,
           currentIndex: 0,
           totalSteps: this.steps.length
-        }));
+        });
         console.log('保存剩余步骤:', remainingSteps.length);
       } else {
-        sessionStorage.removeItem('__replay_remaining_steps__');
+        await clearPendingReplay();
         sendUniqueMessage('replayStatus', { status: 'completed', total: this.steps.length }, 'complete');
       }
 
       sendUniqueMessage('replayStatus', { status: 'navigating', url: url }, 'nav');
+      this.isReplaying = false;
       window.location.href = url;
       return true;
     } catch (error) {
@@ -304,17 +376,18 @@
           for (var i = this.currentIndex + 1; i < this.steps.length; i++) {
             remainingSteps.push(this.steps[i]);
           }
-          if (remainingSteps.length > 0 && !sessionStorage.getItem('__replay_remaining_steps__')) {
-            sessionStorage.setItem('__replay_remaining_steps__', JSON.stringify({
+          if (remainingSteps.length > 0) {
+            await savePendingReplay({
               steps: remainingSteps,
               speed: this.speed,
               currentIndex: 0,
               totalSteps: this.steps.length
-            }));
+            });
             console.log('Enter键保存剩余步骤:', remainingSteps.length);
           }
           sendUniqueMessage('replayStatus', { status: 'navigating' }, 'nav_enter');
           this.log('Enter key will submit form; saved remaining steps=' + remainingSteps.length, 'navigate', step);
+          this.isReplaying = false;
           setTimeout(function() { form.submit(); }, 100);
           return true;
         }
@@ -329,10 +402,20 @@
   };
 
   ActionReplayer.prototype.executeClick = async function(step) {
-    var element = this.findElement(step);
+    await this.waitForStepPage(step, 8000);
+    var element = await this.waitForElement(step, 8000);
     if (!element && step.x !== undefined) {
-      element = document.elementFromPoint(step.x, step.y);
+      var expectedPoint = this.getExpectedPoint(step);
+      element = document.elementFromPoint(expectedPoint ? expectedPoint.x : step.x, expectedPoint ? expectedPoint.y : step.y);
       this.log('Click fallback by coordinate hit: ' + describeElement(element), element ? 'info' : 'fail', step);
+      if (element && step.target && step.target.textContent) {
+        var expectedText = this.normalizeText(step.target.textContent);
+        var actualText = this.normalizeText(element.textContent || element.value || '');
+        if (actualText && actualText !== expectedText && actualText.indexOf(expectedText) < 0) {
+          this.log('Click fallback text mismatch; refusing coordinate click: ' + actualText, 'fail', step);
+          element = null;
+        }
+      }
     }
     if (!element) {
       this.log('Click failed: element not found', 'fail', step);
@@ -340,6 +423,21 @@
       return false;
     }
     try {
+      var remainingSteps = [];
+      for (var i = this.currentIndex + 1; i < this.steps.length; i++) {
+        remainingSteps.push(this.steps[i]);
+      }
+      if (remainingSteps.length > 0) {
+        await savePendingReplay({
+          steps: remainingSteps,
+          speed: this.speed,
+          currentIndex: 0,
+          totalSteps: this.steps.length
+        });
+        setTimeout(function() {
+          if (window.__replayer && window.__replayer.isReplaying) clearPendingReplay();
+        }, 2500);
+      }
       this.log('Prepare click on ' + describeElement(element), 'executing', step);
       element.scrollIntoView({ behavior: 'smooth', block: 'center' });
       await new Promise(function(r) { setTimeout(r, 200); });
@@ -504,6 +602,7 @@
       if (!step.stepNumber) step.stepNumber = i + 1;
 
       this.sendStatus('executing', i + 1, step);
+      await this.waitForStepPage(step, 8000);
       await this.executeStep(step, i);
 
       if (step.type !== 'navigation') {
@@ -543,7 +642,7 @@
     this.isPaused = false;
     this.steps = [];
     this.currentIndex = -1;
-    sessionStorage.removeItem('__replay_remaining_steps__');
+    clearPendingReplay();
     this.log('Replay stopped and pending steps cleared', 'info');
     this.sendStatus('stopped');
   };
@@ -585,7 +684,7 @@
 window.__replay_pending_checked__ = false;
 console.log('重置 checkPendingReplay 标记');
 
-(function checkPendingReplay() {
+(async function checkPendingReplay() {
   sendReplayLog('Pending replay check started on ' + window.location.href, 'info');
   console.log('checkPendingReplay 开始执行');
   
@@ -594,17 +693,18 @@ console.log('重置 checkPendingReplay 标记');
     var globalStop = localStorage.getItem('__replay_global_stop__');
     if (globalStop === 'true') {
       console.log('全局停止标志存在，跳过恢复回放');
-      sessionStorage.removeItem('__replay_remaining_steps__');
+      await clearPendingReplay();
       return;
     }
   } catch (e) {}
   
-  var pendingData = sessionStorage.getItem('__replay_remaining_steps__');
+  var pendingData = await getPendingReplay();
   if (!pendingData) {
     console.log('没有待回放的步骤');
     return;
   }
   
+  if (typeof pendingData !== 'string') pendingData = JSON.stringify(pendingData);
   console.log('发现待回放步骤:', pendingData.substring(0, 200));
   
   try {
@@ -616,7 +716,7 @@ console.log('重置 checkPendingReplay 标记');
     console.log('待回放步骤数量:', steps.length);
     
     // ✅ 关键修复：立即清除，防止重复
-    sessionStorage.removeItem('__replay_remaining_steps__');
+    await clearPendingReplay();
     
     if (steps.length === 0) {
       console.log('剩余步骤为空');
@@ -687,7 +787,7 @@ console.log('重置 checkPendingReplay 标记');
     
   } catch (e) {
     console.error('恢复回放失败:', e);
-    sessionStorage.removeItem('__replay_remaining_steps__');
+    await clearPendingReplay();
   }
 })();
 
