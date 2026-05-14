@@ -188,6 +188,97 @@
     return this.findElement(step);
   };
 
+  ActionReplayer.prototype.findBySelector = function(selector) {
+    if (!selector) return null;
+    try {
+      return document.querySelector(selector);
+    } catch (e) {
+      return null;
+    }
+  };
+
+  ActionReplayer.prototype.getElementText = function(element) {
+    if (!element) return '';
+    return this.normalizeText(element.textContent || element.value || '');
+  };
+
+  ActionReplayer.prototype.pageHasText = function(text) {
+    var expected = this.normalizeText(text);
+    if (!expected) return false;
+    return this.normalizeText(document.body ? document.body.innerText || document.body.textContent : '').indexOf(expected) >= 0;
+  };
+
+  ActionReplayer.prototype.evaluateAssertionOnce = function(assertion) {
+    var type = assertion.type || 'textVisible';
+    var expected = assertion.expected || assertion.target || '';
+    var selector = assertion.selector || '';
+    var element = selector ? this.findBySelector(selector) : null;
+    var actual = '';
+
+    if (type === 'textVisible') {
+      actual = this.pageHasText(expected) ? expected : '';
+      return { passed: !!actual, actual: actual || '未找到文本' };
+    }
+    if (type === 'elementExists') {
+      actual = element ? describeElement(element) : '未找到元素';
+      return { passed: !!element, actual: actual };
+    }
+    if (type === 'elementNotExists') {
+      actual = element ? describeElement(element) : '元素不存在';
+      return { passed: !element, actual: actual };
+    }
+    if (type === 'urlContains') {
+      actual = window.location.href;
+      return { passed: actual.indexOf(expected) >= 0, actual: actual };
+    }
+    if (type === 'elementTextContains') {
+      actual = this.getElementText(element);
+      return { passed: !!element && actual.indexOf(this.normalizeText(expected)) >= 0, actual: element ? actual : '未找到元素' };
+    }
+    if (type === 'elementTextEquals') {
+      actual = this.getElementText(element);
+      return { passed: !!element && actual === this.normalizeText(expected), actual: element ? actual : '未找到元素' };
+    }
+    return { passed: false, actual: '', error: 'Unknown assertion type: ' + type };
+  };
+
+  ActionReplayer.prototype.runAssertion = async function(assertion, step) {
+    if (!assertion || assertion.enabled === false) {
+      return Object.assign({}, assertion || {}, { status: 'skipped', actual: '', error: '' });
+    }
+
+    var timeout = assertion.timeout == null ? 2000 : Math.max(0, Number(assertion.timeout) || 0);
+    var start = Date.now();
+    var lastResult = null;
+    while (Date.now() - start <= timeout) {
+      lastResult = this.evaluateAssertionOnce(assertion);
+      if (lastResult.passed) break;
+      if (timeout === 0) break;
+      await new Promise(function(r) { setTimeout(r, 200); });
+    }
+
+    var status = lastResult && lastResult.passed ? 'passed' : 'failed';
+    var result = Object.assign({}, assertion, {
+      status: status,
+      actual: lastResult ? lastResult.actual : '',
+      error: lastResult && lastResult.error ? lastResult.error : ''
+    });
+    this.log('Assertion ' + status + ': ' + (assertion.type || '') + ' expected=' + (assertion.expected || assertion.selector || ''), status === 'passed' ? 'success' : 'fail', step);
+    return result;
+  };
+
+  ActionReplayer.prototype.runAssertions = async function(step) {
+    var assertions = Array.isArray(step.assertions) ? step.assertions : [];
+    var results = [];
+    var success = true;
+    for (var i = 0; i < assertions.length; i++) {
+      var result = await this.runAssertion(assertions[i], step);
+      results.push(result);
+      if (result.status === 'failed') success = false;
+    }
+    return { success: success, results: results };
+  };
+
   ActionReplayer.prototype.findElement = function(step) {
     this.log('Locate element: ' + describeTarget(step), 'info', step);
     var expectedPoint = this.getExpectedPoint(step);
@@ -550,13 +641,16 @@
         if (!success) {
           self.log('Step #' + step.stepNumber + ' returned failure before result event', 'fail', step);
         }
+        var assertionRun = await self.runAssertions(step);
+        if (!assertionRun.success) success = false;
         var duration = Date.now() - startTime;
 
         sendUniqueMessage('replayStepResult', {
           index: index,
           stepNumber: step.stepNumber,
           success: success,
-          duration: duration
+          duration: duration,
+          assertions: assertionRun.results
         }, 'result_' + index);
 
         console.log('步骤 #' + step.stepNumber + ' 执行' + (success ? '成功' : '失败') + ' 耗时:' + duration + 'ms');
@@ -637,21 +731,23 @@
     this.sendStatus('resumed', this.currentIndex + 1);
   };
 
-  ActionReplayer.prototype.stop = function() {
+  ActionReplayer.prototype.stop = function(silent) {
     this.isReplaying = false;
     this.isPaused = false;
     this.steps = [];
     this.currentIndex = -1;
     clearPendingReplay();
-    this.log('Replay stopped and pending steps cleared', 'info');
-    this.sendStatus('stopped');
+    if (!silent) {
+      this.log('Replay stopped and pending steps cleared', 'info');
+      this.sendStatus('stopped');
+    }
   };
 
   chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
     try {
       switch (request.action) {
         case 'startReplayScript':
-          if (window.__replayer) window.__replayer.stop();
+          if (window.__replayer) window.__replayer.stop(true);
           var replayer = new ActionReplayer(request.steps);
           replayer.speed = request.speed || 1;
           replayer.highlightEnabled = request.highlight !== false;
@@ -763,7 +859,7 @@ console.log('重置 checkPendingReplay 标记');
       console.log('开始恢复回放，执行步骤:', filteredSteps.length);
       
       if (window.__replayer) {
-        window.__replayer.stop();
+        window.__replayer.stop(true);
         window.__replayer = null;
       }
       

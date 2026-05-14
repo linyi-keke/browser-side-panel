@@ -11,6 +11,9 @@ var currentPageTitle = '';
 var currentSessionId = null;
 var currentFileName = '';
 var replaySteps = [];
+var currentReplaySessionId = null;
+var continuationSteps = [];
+var continuationSessionId = null;
 var isReplaying = false;
 var isReplayPaused = false;
 var replaySpeed = 1;
@@ -18,8 +21,19 @@ var currentTabId = null;
 var stepResults = {};
 var editingStepIndex = -1;
 var editInfoStepIndex = -1;
+var editingAssertionIndex = -1;
+var editingAssertionSource = 'record';
 var _lastReceivedMessage = {};
 var _lastMessageTime = {};
+
+var assertionTypeMap = {
+  textVisible: '文本存在',
+  elementExists: '元素存在',
+  elementNotExists: '元素不存在',
+  urlContains: 'URL包含',
+  elementTextContains: '元素文本包含',
+  elementTextEquals: '元素文本等于'
+};
 
 var typeMap = {
   click: '鼠标点击', rightClick: '右键点击', dblclick: '双击',
@@ -68,7 +82,7 @@ var _lastAddLogMessage = '';
 
 function addReplayLog(message, type) {
   type = type || 'info';
-  
+
   // 1秒内相同的消息不重复添加
   var now = Date.now();
   var logKey = message + '_' + type;
@@ -77,7 +91,7 @@ function addReplayLog(message, type) {
   }
   _lastAddLogMessage = logKey;
   _lastAddLogTime = now;
-  
+
   addReplayLogDirect(message, type);
 }
 
@@ -175,48 +189,58 @@ async function startRecording() {
   try {
     var tab = await getCurrentTab();
     if (!tab) { showToast('无法获取当前标签页'); return; }
-    
+
     currentPageUrl = tab.url;
     currentPageTitle = tab.title;
     updateUrlDisplay(tab.url, tab.title);
     var startsOnRestrictedPage = isRestrictedTabUrl(tab.url);
-    
+    var initialSourceSteps = replaySteps.length ? replaySteps : continuationSteps;
+    var initialSteps = cloneStepsForRecording(initialSourceSteps);
+
     await chrome.runtime.sendMessage({ type: 'clearHistory' });
-    actionHistory = [];
-    stepCounter = 0;
+    actionHistory = initialSteps.length ? [].concat(initialSteps).reverse() : [];
+    stepCounter = initialSteps.length;
     stepResults = {};
     updateStepCount();
-    renderActionList([]);
-    
+    renderActionList(actionHistory);
+
     var response = await chrome.runtime.sendMessage({
       type: 'startRecording',
       url: tab.url,
       title: tab.title,
-      tabId: tab.id
+      tabId: tab.id,
+      initialActions: initialSteps
     });
-    
+
     if (response && response.success) {
       isRecording = true;
       currentSessionId = response.sessionId;
+      currentReplaySessionId = null;
       currentFileName = response.fileName || '';
       recordingStartTime = Date.now();
-      
+
       startBtn.disabled = true;
       stopBtn.disabled = false;
       recordingIndicator.classList.remove('hidden');
-      
+
       if (recordingTimer) clearInterval(recordingTimer);
       recordingTimer = setInterval(updateRecordingTimer, 1000);
-      
-      try { await chrome.tabs.sendMessage(tab.id, { action: 'updateRecordingStatus', isRecording: true }); } catch (e) {}
-      
+
+      try {
+        await chrome.tabs.sendMessage(tab.id, {
+          action: 'updateRecordingStatus',
+          isRecording: true,
+          suppressInitialNavigation: initialSteps.length > 0
+        });
+      } catch (e) {}
+
       var fileNameDisplay = document.getElementById('currentFileName');
       if (startsOnRestrictedPage) {
         showToast('当前页无法注入脚本，打开普通网页后会开始录制');
         return;
       }
       if (fileNameDisplay && response.fileName) fileNameDisplay.textContent = '📁 ' + response.fileName;
-      
+
       showToast('🔴 录制已开始');
     }
   } catch (error) {
@@ -233,6 +257,8 @@ async function stopRecording() {
       var stoppedSteps = normalizeReplaySteps(stoppedSession.actions || actionHistory);
       isRecording = false;
       currentSessionId = null;
+      currentReplaySessionId = stoppedSession.id || null;
+      continuationSessionId = stoppedSession.id || null;
       startBtn.disabled = false;
       stopBtn.disabled = true;
       recordingIndicator.classList.add('hidden');
@@ -243,6 +269,7 @@ async function stopRecording() {
       if (tab) { try { await chrome.tabs.sendMessage(tab.id, { action: 'updateRecordingStatus', isRecording: false }); } catch (e) {} }
       if (stoppedSteps.length > 0) {
         replaySteps = stoppedSteps;
+        continuationSteps = cloneStepsForRecording(stoppedSteps);
         stepResults = {};
         showReplayPanel(stoppedSession.fileName || currentFileName || 'current-recording', replaySteps);
         renderReplayList();
@@ -290,9 +317,9 @@ function deleteStep(index) {
   var action = actionHistory[index];
   var stepNum = action.stepNumber || (index + 1);
   var typeText = typeMap[action.type] || action.type;
-  
+
   if (!confirm('确定要删除步骤 #' + stepNum + ' (' + typeText + ') 吗？\n此操作不可恢复。')) return;
-  
+
   actionHistory.splice(index, 1);
   actionHistory.forEach(function(a, i) { a.stepNumber = actionHistory.length - i; });
   stepCounter = actionHistory.length;
@@ -307,12 +334,12 @@ function openEditStepDialog(index) {
   editInfoStepIndex = index;
   var action = actionHistory[index];
   if (!action) return;
-  
+
   var stepNum = action.stepNumber || (index + 1);
   document.getElementById('editInfoStepNumber').textContent = '步骤 #' + stepNum;
   document.getElementById('editInfoStepType').textContent = typeMap[action.type] || action.type;
   document.getElementById('editInfoStepName').value = action.stepName || '';
-  
+
   // 坐标信息
   var coordGroup = document.getElementById('editInfoCoordGroup');
   if (['click', 'rightClick', 'dblclick'].indexOf(action.type) !== -1) {
@@ -320,21 +347,21 @@ function openEditStepDialog(index) {
     document.getElementById('editInfoCoordX').value = action.x || '';
     document.getElementById('editInfoCoordY').value = action.y || '';
   } else { coordGroup.style.display = 'none'; }
-  
+
   // 输入内容
   var valueGroup = document.getElementById('editInfoValueGroup');
   if (action.type === 'input') {
     valueGroup.style.display = 'block';
     document.getElementById('editInfoValue').value = action.value || '';
   } else { valueGroup.style.display = 'none'; }
-  
+
   // URL信息
   var urlGroup = document.getElementById('editInfoUrlGroup');
   if (action.type === 'navigation') {
     urlGroup.style.display = 'block';
     document.getElementById('editInfoUrl').value = action.url || '';
   } else { urlGroup.style.display = 'none'; }
-  
+
   editStepInfoDialog.classList.remove('hidden');
   document.getElementById('editInfoStepName').focus();
 }
@@ -346,20 +373,20 @@ function closeEditStepDialog() {
 
 function saveStepInfo() {
   if (editInfoStepIndex < 0 || editInfoStepIndex >= actionHistory.length) return;
-  
+
   var action = actionHistory[editInfoStepIndex];
   action.stepName = document.getElementById('editInfoStepName').value.trim() || null;
-  
+
   if (['click', 'rightClick', 'dblclick'].indexOf(action.type) !== -1) {
     var x = parseInt(document.getElementById('editInfoCoordX').value);
     var y = parseInt(document.getElementById('editInfoCoordY').value);
     if (!isNaN(x)) action.x = x;
     if (!isNaN(y)) action.y = y;
   }
-  
+
   if (action.type === 'input') action.value = document.getElementById('editInfoValue').value;
   if (action.type === 'navigation') action.url = document.getElementById('editInfoUrl').value;
-  
+
   chrome.runtime.sendMessage({ type: 'updateStepInfo', index: editInfoStepIndex, data: action }).catch(function() {});
   renderActionList(actionHistory);
   closeEditStepDialog();
@@ -368,18 +395,260 @@ function saveStepInfo() {
 
 // ==================== 操作卡片 ====================
 
+function ensureAssertionDialog() {
+  var dialog = document.getElementById('assertionDialog');
+  if (dialog) return dialog;
+
+  dialog = document.createElement('div');
+  dialog.id = 'assertionDialog';
+  dialog.className = 'dialog-overlay hidden';
+  dialog.innerHTML =
+    '<div class="dialog assertion-dialog">' +
+      '<div class="dialog-header">' +
+        '<h3>步骤断言</h3>' +
+        '<button id="closeAssertionDialogBtn" class="dialog-close">&times;</button>' +
+      '</div>' +
+      '<div class="dialog-body">' +
+        '<div class="form-group"><label>步骤</label><span id="assertionStepNumber" class="step-number-display"></span></div>' +
+        '<div id="assertionRows" class="assertion-edit-list"></div>' +
+        '<button id="addAssertionBtn" class="btn btn-assertion-add" type="button">+ 添加断言</button>' +
+      '</div>' +
+      '<div class="dialog-footer">' +
+        '<button id="cancelAssertionBtn" class="btn btn-cancel">取消</button>' +
+        '<button id="confirmAssertionBtn" class="btn btn-confirm">保存</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(dialog);
+
+  document.getElementById('closeAssertionDialogBtn').addEventListener('click', closeAssertionDialog);
+  document.getElementById('cancelAssertionBtn').addEventListener('click', closeAssertionDialog);
+  document.getElementById('confirmAssertionBtn').addEventListener('click', saveAssertions);
+  document.getElementById('addAssertionBtn').addEventListener('click', function() { addAssertionRow(); });
+  return dialog;
+}
+
+function createDefaultAssertion() {
+  return {
+    id: 'assert_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+    type: 'textVisible',
+    selector: '',
+    expected: '',
+    enabled: true,
+    timeout: 2000
+  };
+}
+
+function getEditableSteps(source) {
+  return source === 'replay' ? replaySteps : actionHistory;
+}
+
+function openAssertionDialog(index, source) {
+  editingAssertionSource = source === 'replay' ? 'replay' : 'record';
+  var steps = getEditableSteps(editingAssertionSource);
+  var action = steps[index];
+  if (!action) return;
+
+  editingAssertionIndex = index;
+  var dialog = ensureAssertionDialog();
+  document.getElementById('assertionStepNumber').textContent = '#' + (action.stepNumber || (index + 1));
+
+  var rows = document.getElementById('assertionRows');
+  rows.innerHTML = '';
+  var assertions = Array.isArray(action.assertions) ? action.assertions : [];
+  if (assertions.length === 0) addAssertionRow(createDefaultAssertion());
+  else assertions.forEach(function(assertion) { addAssertionRow(assertion); });
+
+  dialog.classList.remove('hidden');
+}
+
+function closeAssertionDialog() {
+  var dialog = document.getElementById('assertionDialog');
+  if (dialog) dialog.classList.add('hidden');
+  editingAssertionIndex = -1;
+  editingAssertionSource = 'record';
+}
+
+function getExportSourceSteps() {
+  return replaySteps && replaySteps.length ? replaySteps : actionHistory;
+}
+
+function cloneStepsForRecording(steps) {
+  return (steps || []).map(function(step, index) {
+    var clone = Object.assign({}, step, {
+      target: Object.assign({}, step.target || {}),
+      assertions: Array.isArray(step.assertions) ? step.assertions.map(function(assertion) {
+        return Object.assign({}, assertion);
+      }) : []
+    });
+    clone.stepNumber = index + 1;
+    delete clone.assertionResults;
+    return clone;
+  });
+}
+
+function addAssertionRow(assertion) {
+  assertion = assertion || createDefaultAssertion();
+  var rows = document.getElementById('assertionRows');
+  if (!rows) return;
+
+  var row = document.createElement('div');
+  row.className = 'assertion-edit-row';
+  row.dataset.id = assertion.id || createDefaultAssertion().id;
+  row.innerHTML =
+    '<div class="assertion-row-top">' +
+      '<select class="form-input assertion-type">' +
+        '<option value="textVisible">文本存在</option>' +
+        '<option value="elementExists">元素存在</option>' +
+        '<option value="elementNotExists">元素不存在</option>' +
+        '<option value="urlContains">URL包含</option>' +
+        '<option value="elementTextContains">元素文本包含</option>' +
+        '<option value="elementTextEquals">元素文本等于</option>' +
+      '</select>' +
+      '<label class="assertion-enabled"><input type="checkbox" class="assertion-enabled-input"> 启用</label>' +
+      '<button type="button" class="btn-card-action btn-assertion-remove" title="删除断言">×</button>' +
+    '</div>' +
+    '<input class="form-input assertion-selector" placeholder="CSS selector，可选" value="' + escapeHTML(assertion.selector || '') + '">' +
+    '<input class="form-input assertion-expected" placeholder="期望文本 / URL 片段" value="' + escapeHTML(assertion.expected || assertion.target || '') + '">' +
+    '<input class="form-input assertion-timeout" type="number" min="0" step="500" placeholder="超时(ms)" value="' + escapeHTML(String(assertion.timeout == null ? 2000 : assertion.timeout)) + '">';
+
+  row.querySelector('.assertion-type').value = assertion.type || 'textVisible';
+  row.querySelector('.assertion-enabled-input').checked = assertion.enabled !== false;
+  row.querySelector('.btn-assertion-remove').addEventListener('click', function() { row.remove(); });
+  rows.appendChild(row);
+}
+
+function collectAssertionRows() {
+  var rows = document.querySelectorAll('#assertionRows .assertion-edit-row');
+  var assertions = [];
+  var errors = [];
+  rows.forEach(function(row, rowIndex) {
+    var type = row.querySelector('.assertion-type').value;
+    var selector = row.querySelector('.assertion-selector').value.trim();
+    var expected = row.querySelector('.assertion-expected').value.trim();
+    var timeout = parseInt(row.querySelector('.assertion-timeout').value, 10);
+    var enabled = row.querySelector('.assertion-enabled-input').checked;
+    var needsExpected = ['textVisible', 'urlContains', 'elementTextContains', 'elementTextEquals'].indexOf(type) !== -1;
+    var needsSelector = ['elementExists', 'elementNotExists', 'elementTextContains', 'elementTextEquals'].indexOf(type) !== -1;
+
+    if (needsExpected && !expected) {
+      errors.push('第 ' + (rowIndex + 1) + ' 条断言缺少期望内容');
+      row.querySelector('.assertion-expected').classList.add('form-input-error');
+      return;
+    }
+    row.querySelector('.assertion-expected').classList.remove('form-input-error');
+
+    if (needsSelector && !selector) {
+      errors.push('第 ' + (rowIndex + 1) + ' 条断言缺少 CSS selector');
+      row.querySelector('.assertion-selector').classList.add('form-input-error');
+      return;
+    }
+    row.querySelector('.assertion-selector').classList.remove('form-input-error');
+
+    assertions.push({
+      id: row.dataset.id || createDefaultAssertion().id,
+      type: type,
+      selector: selector,
+      expected: expected,
+      enabled: enabled,
+      timeout: isNaN(timeout) ? 2000 : Math.max(0, timeout)
+    });
+  });
+  return { assertions: assertions, errors: errors };
+}
+
+function saveAssertions() {
+  var steps = getEditableSteps(editingAssertionSource);
+  if (editingAssertionIndex < 0 || editingAssertionIndex >= steps.length) return;
+
+  var collected = collectAssertionRows();
+  if (collected.errors.length) {
+    showToast(collected.errors[0]);
+    return;
+  }
+  var assertions = collected.assertions;
+  steps[editingAssertionIndex].assertions = assertions;
+  steps[editingAssertionIndex].assertionResults = [];
+
+  if (editingAssertionSource === 'replay') {
+    continuationSteps = cloneStepsForRecording(steps);
+    continuationSessionId = currentReplaySessionId || continuationSessionId;
+    if (currentReplaySessionId) {
+      chrome.runtime.sendMessage({
+        type: 'updateSessionSteps',
+        sessionId: currentReplaySessionId,
+        steps: cloneStepsForRecording(steps)
+      }).catch(function() {});
+    }
+    renderReplayList();
+  } else {
+    chrome.runtime.sendMessage({ type: 'updateStepInfo', index: editingAssertionIndex, data: steps[editingAssertionIndex] }).catch(function() {});
+    renderActionList(actionHistory);
+  }
+  closeAssertionDialog();
+  showToast('断言已保存');
+}
+
+function getAssertionSummary(action, isReplayMode) {
+  var assertions = Array.isArray(action.assertions) ? action.assertions : [];
+  if (assertions.length === 0) return '';
+
+  var enabledAssertions = assertions.filter(function(item) { return item && item.enabled !== false; });
+  var results = Array.isArray(action.assertionResults) ? action.assertionResults : [];
+  var passed = results.filter(function(item) { return item && item.status === 'passed'; }).length;
+  var failed = results.filter(function(item) { return item && item.status === 'failed'; }).length;
+  var skipped = assertions.length - enabledAssertions.length + results.filter(function(item) { return item && item.status === 'skipped'; }).length;
+  var summaryClass = 'pending';
+  var summaryText = enabledAssertions.length + ' 个断言';
+
+  if (isReplayMode && results.length) {
+    if (failed > 0) {
+      summaryClass = 'failed';
+      summaryText = passed + '/' + enabledAssertions.length + ' 通过';
+    } else if (passed >= enabledAssertions.length) {
+      summaryClass = 'passed';
+      summaryText = '全部通过';
+    } else {
+      summaryText = passed + '/' + enabledAssertions.length + ' 通过';
+    }
+  }
+  if (skipped && enabledAssertions.length === 0) {
+    summaryClass = 'skipped';
+    summaryText = '已禁用';
+  }
+
+  var detailHTML = assertions.map(function(assertion, idx) {
+    var result = results[idx] || {};
+    var status = result.status || (assertion.enabled === false ? 'skipped' : 'pending');
+    var label = assertionTypeMap[assertion.type] || assertion.type;
+    var main = assertion.expected || assertion.selector || '';
+    var actual = result.actual ? '<div class="assertion-actual">实际: ' + escapeHTML(result.actual) + '</div>' : '';
+    var error = result.error ? '<div class="assertion-error">' + escapeHTML(result.error) + '</div>' : '';
+    return '<div class="assertion-item ' + status + '">' +
+      '<span class="assertion-dot"></span>' +
+      '<div class="assertion-text"><strong>' + escapeHTML(label) + '</strong>' +
+      (main ? '<span>' + escapeHTML(main) + '</span>' : '') +
+      actual + error + '</div>' +
+    '</div>';
+  }).join('');
+
+  return '<div class="assertion-summary ' + summaryClass + '">' +
+    '<div class="assertion-summary-head"><span>断言</span><span>' + escapeHTML(summaryText) + '</span></div>' +
+    '<div class="assertion-items">' + detailHTML + '</div>' +
+  '</div>';
+}
+
 function createActionCard(action, index, isReplayMode) {
   isReplayMode = isReplayMode || false;
-  
+
   if (!action) {
     var emptyCard = document.createElement('div');
     emptyCard.className = 'action-card';
     emptyCard.innerHTML = '<div class="card-header"><span>无效步骤</span></div>';
     return emptyCard;
   }
-  
+
   var target = action.target || {};
-  
+
   var statusClass = '';
   if (isReplayMode) {
     var result = stepResults[index];
@@ -387,16 +656,16 @@ function createActionCard(action, index, isReplayMode) {
     else if (result === 'fail') statusClass = ' replay-fail';
     else statusClass = ' replay-pending';
   }
-  
+
   var card = document.createElement('div');
   card.className = 'action-card ' + (action.type || '') + statusClass;
-  
+
   var iconMap = {
     click: '🖱️', rightClick: '🖱️', dblclick: '🖱️',
     scroll: '📜', resize: '📏', focus: '🔍',
     input: '⌨️', keydown: '⌨️', submit: '📤', navigation: '🌐'
   };
-  
+
   var icon = iconMap[action.type] || '📌';
   var typeText = typeMap[action.type] || action.type;
   var time = action.timestamp ? new Date(action.timestamp).toLocaleTimeString() : '';
@@ -405,7 +674,7 @@ function createActionCard(action, index, isReplayMode) {
     stepNum = index + 1;
   }
   var hasName = action.stepName && action.stepName.trim();
-  
+
   // 状态图标
   var statusIcon = '';
   if (isReplayMode) {
@@ -414,7 +683,7 @@ function createActionCard(action, index, isReplayMode) {
     else if (result2 === 'fail') statusIcon = '<span class="replay-status-icon fail">❌</span>';
     else statusIcon = '<span class="replay-status-icon pending">⏳</span>';
   }
-  
+
   // 点击内容描述
   var actionDescription = '';
   if (['click', 'rightClick', 'dblclick'].indexOf(action.type) !== -1 && target.textContent) {
@@ -424,10 +693,10 @@ function createActionCard(action, index, isReplayMode) {
       actionDescription = '<span class="click-content">"' + escapeHTML(displayText) + '"</span>';
     }
   }
-  
+
   // 坐标/操作信息
   var coordinatesHTML = '';
-  
+
   if (action.type === 'scroll') {
     coordinatesHTML = '<div class="card-body"><div class="card-info-item"><div class="card-info-label">水平滚动</div><div class="card-info-value coordinate">' + (action.scrollX || 0) + 'px</div></div><div class="card-info-item"><div class="card-info-label">垂直滚动</div><div class="card-info-value coordinate">' + (action.scrollY || 0) + 'px</div></div></div><div class="scroll-indicator"><span class="card-info-label">📍</span><span class="card-info-value">(' + (action.scrollX || 0) + ', ' + (action.scrollY || 0) + ')</span></div>';
   } else if (action.type === 'resize') {
@@ -448,7 +717,7 @@ function createActionCard(action, index, isReplayMode) {
   } else {
     coordinatesHTML = '<div class="card-body"><div class="card-info-item"><div class="card-info-label">Client X</div><div class="card-info-value coordinate">' + (action.x != null ? action.x + 'px' : '-') + '</div></div><div class="card-info-item"><div class="card-info-label">Client Y</div><div class="card-info-value coordinate">' + (action.y != null ? action.y + 'px' : '-') + '</div></div>' + (action.pageX != null ? '<div class="card-info-item"><div class="card-info-label">Page X</div><div class="card-info-value">' + action.pageX + 'px</div></div>' : '') + (action.pageY != null ? '<div class="card-info-item"><div class="card-info-label">Page Y</div><div class="card-info-value">' + action.pageY + 'px</div></div>' : '') + '</div>';
   }
-  
+
   // 视口信息
   var viewportHTML = '';
   var vpW = action.viewportWidth || action.windowWidth;
@@ -456,14 +725,14 @@ function createActionCard(action, index, isReplayMode) {
   if (vpW && vpH) {
     viewportHTML = '<div class="viewport-info"><span class="card-info-label">📐 视口</span><span class="card-info-value">' + vpW + ' × ' + vpH + '</span></div>';
   }
-  
+
   // 页面URL信息
   var pageUrlHTML = '';
   if (action.pageUrl && action.pageUrl !== currentPageUrl) {
     var shortUrl = action.pageUrl.length > 40 ? action.pageUrl.substring(0, 40) + '...' : action.pageUrl;
     pageUrlHTML = '<div class="page-url-info"><span class="card-info-label">🌐</span><span class="target-desc" title="' + escapeHTML(action.pageUrl) + '">' + escapeHTML(shortUrl) + '</span></div>';
   }
-  
+
   // 目标元素
   var targetHTML = '';
   if (target.tagName && target.tagName !== 'PAGE') {
@@ -475,21 +744,45 @@ function createActionCard(action, index, isReplayMode) {
     }
     targetHTML = '<div class="target-info"><span class="card-info-label">🎯</span><span class="target-desc">' + escapeHTML(desc) + '</span></div>';
   }
-  
+
   // 步骤名称标签
   var stepNameTag = '';
   if (hasName) {
     stepNameTag = '<span class="step-name-tag">' + escapeHTML(action.stepName) + '</span>';
   }
-  
+
   // 操作按钮（录制模式）
+  var assertionHTML = getAssertionSummary(action, isReplayMode);
   var actionButtons = '';
-  if (!isReplayMode) {
+  if (isReplayMode) {
+    actionButtons = '<div class="card-actions always-visible"><button class="btn-card-action btn-card-assert" data-index="' + index + '" title="编辑断言">断</button></div>';
+  } else {
     actionButtons = '<div class="card-actions"><button class="btn-card-action btn-card-edit" data-index="' + index + '" title="修改信息">✏️</button><button class="btn-card-action btn-card-delete" data-index="' + index + '" title="删除步骤">🗑️</button></div>';
   }
-  
+
   card.innerHTML = '<div class="card-header"><div class="action-type"><span class="step-number ' + (hasName ? 'has-name' : '') + '" data-index="' + index + '" title="' + (hasName ? escapeHTML(action.stepName) : '点击编辑名称') + '">#' + stepNum + '</span>' + statusIcon + '<span class="action-icon">' + icon + '</span><div class="action-type-info"><span class="action-type-text">' + typeText + '</span>' + actionDescription + stepNameTag + '</div></div><div class="card-header-right"><span class="action-time">' + time + '</span>' + actionButtons + '</div></div>' + coordinatesHTML + viewportHTML + pageUrlHTML + targetHTML;
-  
+
+  if (assertionHTML) card.insertAdjacentHTML('beforeend', assertionHTML);
+
+  if (!isReplayMode) {
+    var actionsWrap = card.querySelector('.card-actions');
+    if (actionsWrap && !actionsWrap.querySelector('.btn-card-assert')) {
+      var assertionButton = document.createElement('button');
+      assertionButton.className = 'btn-card-action btn-card-assert';
+      assertionButton.dataset.index = index;
+      assertionButton.title = '编辑断言';
+      assertionButton.textContent = '断';
+      actionsWrap.insertBefore(assertionButton, actionsWrap.firstChild);
+    }
+  }
+
+  var assertBtn = card.querySelector('.btn-card-assert');
+  if (assertBtn) {
+    assertBtn.addEventListener('click', (function(idx) {
+      return function(e) { e.stopPropagation(); openAssertionDialog(idx, isReplayMode ? 'replay' : 'record'); };
+    })(index));
+  }
+
   // 绑定事件
   if (!isReplayMode) {
     var editBtn = card.querySelector('.btn-card-edit');
@@ -498,14 +791,14 @@ function createActionCard(action, index, isReplayMode) {
         return function(e) { e.stopPropagation(); openEditStepDialog(idx); };
       })(index));
     }
-    
+
     var deleteBtn = card.querySelector('.btn-card-delete');
     if (deleteBtn) {
       deleteBtn.addEventListener('click', (function(idx) {
         return function(e) { e.stopPropagation(); deleteStep(idx); };
       })(index));
     }
-    
+
     var stepNumberEl = card.querySelector('.step-number');
     if (stepNumberEl) {
       stepNumberEl.addEventListener('click', (function(idx) {
@@ -513,7 +806,7 @@ function createActionCard(action, index, isReplayMode) {
       })(index));
     }
   }
-  
+
   return card;
 }
 
@@ -522,14 +815,14 @@ function createActionCard(action, index, isReplayMode) {
 function renderActionList(actions, isReplayMode) {
   isReplayMode = isReplayMode || false;
   if (!actionList) return;
-  
+
   actionList.innerHTML = '';
-  
+
   if (!actions || actions.length === 0) {
     actionList.innerHTML = '<div class="empty-state"><div class="empty-icon">📊</div><p>' + (isRecording ? '等待操作...' : isReplayMode ? '回放步骤' : '等待录制') + '</p><p class="empty-hint">' + (isRecording ? '在页面上进行操作' : isReplayMode ? '准备开始回放' : '点击 ⏺️ 录制 按钮开始') + '</p></div>';
     return;
   }
-  
+
   var filtered = actions;
   if (!isReplayMode && currentFilter !== 'all') {
     filtered = actions.filter(function(a) {
@@ -539,12 +832,15 @@ function renderActionList(actions, isReplayMode) {
       return true;
     });
   }
-  
+
   if (filtered.length === 0) { actionList.innerHTML = '<div class="empty-state"><p>没有匹配的操作</p></div>'; return; }
-  
+
   filtered.forEach(function(action, i) { if (!action.stepNumber) action.stepNumber = filtered.length - i; });
-  filtered.forEach(function(action, index) { actionList.appendChild(createActionCard(action, index, isReplayMode)); });
-  
+  filtered.forEach(function(action, index) {
+    var sourceIndex = isReplayMode ? index : actions.indexOf(action);
+    actionList.appendChild(createActionCard(action, sourceIndex >= 0 ? sourceIndex : index, isReplayMode));
+  });
+
   actionList.scrollTop = 0;
 }
 
@@ -552,30 +848,30 @@ function renderActionList(actions, isReplayMode) {
 function renderReplayList() {
   if (!actionList) return;
   actionList.innerHTML = '';
-  
+
   if (!replaySteps || replaySteps.length === 0) {
     actionList.innerHTML = '<div class="empty-state"><div class="empty-icon">📊</div><p>没有回放步骤</p></div>';
     return;
   }
-  
+
   // ✅ 确保 replaySteps 按 stepNumber 升序排列
   var sortedSteps = [].concat(replaySteps).sort(function(a, b) {
     return (a.stepNumber || 0) - (b.stepNumber || 0);
   });
-  
+
   // ✅ 显示顺序：步骤1在最上面（不要反转）
   // 因为回放时是从数组头部开始执行的，所以直接按升序渲染
   sortedSteps.forEach(function(step, index) {
     if (!step.stepNumber) step.stepNumber = index + 1;
     if (!step.target) step.target = {};
-    
+
     // 创建卡片，index 参数用 sortedSteps 中的位置
     var card = createActionCard(step, index, true);
     actionList.appendChild(card);
   });
-  
+
   actionList.scrollTop = 0;
-  
+
   console.log('回放列表渲染完成，顺序:');
   sortedSteps.forEach(function(s, i) {
     console.log('  [' + i + '] 步骤 #' + s.stepNumber + ':', s.type);
@@ -585,17 +881,18 @@ function renderReplayList() {
 // ==================== 导出/清空 ====================
 
 function openExportDialog() {
-  if (actionHistory.length === 0) { showToast('没有可导出的数据'); return; }
-  
+  var exportSourceSteps = getExportSourceSteps();
+  if (exportSourceSteps.length === 0) { showToast('没有可导出的数据'); return; }
+
   var now = new Date();
   var dateStr = now.getFullYear() + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0') + '_' + String(now.getHours()).padStart(2, '0') + String(now.getMinutes()).padStart(2, '0') + String(now.getSeconds()).padStart(2, '0');
-  
+
   fileNameInput.value = '录制_' + dateStr;
   fileDescriptionInput.value = '';
-  
-  var namedSteps = actionHistory.filter(function(a) { return a.stepName; }).length;
-  exportSummary.innerHTML = '📊 共 <span>' + actionHistory.length + '</span> 个步骤' + (namedSteps > 0 ? ' | 🏷️ 已命名 <span>' + namedSteps + '</span> 个步骤' : '');
-  
+
+  var namedSteps = exportSourceSteps.filter(function(a) { return a.stepName; }).length;
+  exportSummary.innerHTML = '📊 共 <span>' + exportSourceSteps.length + '</span> 个步骤' + (namedSteps > 0 ? ' | 🏷️ 已命名 <span>' + namedSteps + '</span> 个步骤' : '');
+
   exportDialog.classList.remove('hidden');
   fileNameInput.focus();
   fileNameInput.select();
@@ -612,11 +909,12 @@ async function confirmExport() {
   var lastInputKey = null;
 
   // 需要先反转成正常顺序再处理
-  var reversedHistory = [].concat(actionHistory).reverse();
+  var exportSourceSteps = getExportSourceSteps();
+  var reversedHistory = replaySteps && replaySteps.length ? [].concat(exportSourceSteps) : [].concat(exportSourceSteps).reverse();
 
   for (var i = 0; i < reversedHistory.length; i++) {
     var action = reversedHistory[i];
-    
+
     if (action.type === 'input') {
       var inputKey = (action.target && (action.target.selector || action.target.id)) || '';
       if (lastInputKey === inputKey && inputKey !== '') {
@@ -633,7 +931,7 @@ async function confirmExport() {
       lastInputKey = null;
     }
   }
-  
+
   // 使用 filteredSteps
   var exportData = {
     name: fileName,
@@ -644,10 +942,11 @@ async function confirmExport() {
       var obj = Object.assign({}, action);
       obj.stepNumber = i + 1;  // 重新编号，从1开始
       obj.stepName = action.stepName || null;
+      delete obj.assertionResults;
       return obj;
     })
   };
-  
+
   try {
     var blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
     var url = URL.createObjectURL(blob);
@@ -671,12 +970,13 @@ async function clearHistory() {
   actionHistory = [];
   stepCounter = 0;
   stepResults = {};
+  currentReplaySessionId = null;
+  continuationSteps = [];
+  continuationSessionId = null;
   updateStepCount();
   renderActionList(actionHistory);
-  showToast('已清空');
+  showToast('???');
 }
-
-// ==================== 导入/回放 ====================
 
 function normalizeReplaySteps(steps) {
   steps = (steps || []).filter(function(s) { return s && s.type; }).map(function(step) {
@@ -689,6 +989,7 @@ function normalizeReplaySteps(steps) {
   });
   steps.forEach(function(step, i) {
     step.stepNumber = i + 1;
+    step.assertionResults = [];
     if (!step.target) step.target = {};
     if (!step.target.textContent && step.target.textContent === undefined) step.target.textContent = '';
     if (!step.target.className) step.target.className = '';
@@ -708,18 +1009,18 @@ async function handleFileSelect(event) {
   var file = event.target.files[0];
   if (!file) return;
   if (!file.name.endsWith('.json')) { showToast('请选择 JSON 文件'); event.target.value = ''; return; }
-  
+
   try {
     var text = await file.text();
     var data = JSON.parse(text);
-    
+
     var steps = [];
     if (data && data.steps && data.steps.length > 0) steps = data.steps;
     else if (data && data.actions && data.actions.length > 0) steps = data.actions;
     else if (Array.isArray(data)) steps = data;
-    
+
     if (!steps.length) { showToast('文件中没有操作步骤'); event.target.value = ''; return; }
-    
+
     // ✅ 按 stepNumber 升序排列（步骤1, 2, 3...）
     steps = normalizeReplaySteps(steps);
     /*
@@ -730,10 +1031,10 @@ async function handleFileSelect(event) {
       return numA - numB;  // 升序：小的在前面
     });
     */
-    
+
     // 重新编号确保连续
     steps.forEach(function(s, i) { s.stepNumber = i + 1; });
-    
+
     // 确保每个步骤有 target
     steps.forEach(function(step) {
       if (!step.target) step.target = {};
@@ -742,24 +1043,27 @@ async function handleFileSelect(event) {
       if (!step.target.id) step.target.id = '';
       if (!step.target.tagName) step.target.tagName = '';
     });
-    
+
     console.log('✅ 导入成功:', steps.length, '个步骤，步骤顺序:');
     steps.forEach(function(s) { console.log('  步骤 #' + s.stepNumber + ':', s.type, s.target ? s.target.textContent || '' : ''); });
-    
+
     // 重置状态
     actionHistory = [];
     stepCounter = steps.length;
     stepResults = {};
     replaySteps = steps;
+    currentReplaySessionId = null;
+    continuationSteps = cloneStepsForRecording(steps);
+    continuationSessionId = null;
     isRecording = false;
-    
+
     if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null; }
     recordingStartTime = null;
     recordingTime.textContent = '00:00';
     recordingIndicator.classList.add('hidden');
     startBtn.disabled = false;
     stopBtn.disabled = true;
-    
+
     updateStepCount();
     showReplayPanel(file.name, steps);
     renderReplayList();  // ✅ 调用修复后的渲染函数
@@ -774,22 +1078,22 @@ async function handleFileSelect(event) {
 function showReplayPanel(fileName, steps) {
   var panel = document.getElementById('replayPanel');
   if (panel) panel.classList.remove('hidden');
-  
+
   var rfn = document.getElementById('replayFileName');
   var rsi = document.getElementById('replayStepInfo');
   var rpb = document.getElementById('replayProgressBar');
   var rcs = document.getElementById('replayCurrentStep');
-  
+
   if (rfn) rfn.textContent = '📄 ' + fileName;
   if (rsi) rsi.textContent = '共 ' + steps.length + ' 个步骤';
   if (rpb) rpb.style.width = '0%';
   if (rcs) rcs.innerHTML = '<span class="text-muted">准备就绪，点击 ▶️ 开始回放</span>';
-  
+
   // ✅ 初始化日志
   clearReplayLog();
   addReplayLog('📄 已加载文件: ' + fileName, 'info');
   addReplayLog('📊 共 ' + steps.length + ' 个步骤', 'info');
-  
+
   // 列出所有步骤
   steps.forEach(function(step, i) {
     var typeNames = {
@@ -813,7 +1117,7 @@ function showReplayPanel(fileName, steps) {
     }
     addReplayLog('  步骤 #' + (step.stepNumber || (i + 1)) + ': ' + typeName + extra, 'info');
   });
-  
+
   updateReplayButtons(false);
 }
 
@@ -821,13 +1125,15 @@ function closeReplayPanel() {
   stopReplayInPage();
 
   replaySteps = [];
+  currentReplaySessionId = null;
   isReplaying = false;
   isReplayPaused = false;
+  replayIsNavigating = false;
   stepResults = {};
-  
+
   var panel = document.getElementById('replayPanel');
   if (panel) panel.classList.add('hidden');
-  
+
   // ✅ 清空日志
   clearReplayLog();
   renderActionList(actionHistory);
@@ -842,28 +1148,28 @@ async function startReplayInPage() {
     showToast('没有可回放的步骤');
     return;
   }
-  
+
   // 防止重复启动
   if (isReplaying && !isReplayPaused) {
     console.log('回放已在运行中');
     showToast('回放已在运行中');
     return;
   }
-  
+
   // 如果是暂停状态，调用恢复
   if (isReplayPaused) {
     console.log('从暂停状态恢复');
     await resumeReplayInPage();
     return;
   }
-  
+
   try {
     var tab = await getCurrentTab();
     if (!tab) {
       showToast('无法获取当前标签页');
       return;
     }
-    
+
     // 1. 清理所有旧的回放数据（通过脚本注入）
     // ✅ 彻底清理所有回放相关数据
     console.log('========== 开始新回放，清理旧数据 ==========');
@@ -879,47 +1185,48 @@ async function startReplayInPage() {
           sessionStorage.removeItem('__replay_current_index__');
           sessionStorage.removeItem('__replay_injected__');
           localStorage.removeItem('__replay_global_stop__');
-          
+
           // 重置所有标记
           window.__replay_pending_checked__ = false;
           window.__replay_injected = false;
-          
+
           // 停止旧回放器
           if (window.__replayer) {
             window.__replayer.stop();
             window.__replayer = null;
           }
-          
+
           console.log('旧回放数据已清理');
         }
       });
     } catch (e) {
       console.log('清理数据失败:', e);
     }
-    
+
     // 等待清理完成
     await new Promise(function(r) { setTimeout(r, 500); });
-    
+
     // 排序步骤
     replaySteps.sort(function(a, b) {
       return (a.stepNumber || 0) - (b.stepNumber || 0);
     });
-    
+
     // 重新编号
     replaySteps.forEach(function(step, idx) {
       step.stepNumber = idx + 1;
+      step.assertionResults = [];
     });
-    
+
     stepResults = {};
     replaySteps.forEach(function(_, i) { stepResults[i] = 'pending'; });
     renderReplayList();
-    
+
     var pb = document.getElementById('replayProgressBar');
     if (pb) pb.style.width = '0%';
-    
+
     var cs = document.getElementById('replayCurrentStep');
     if (cs) cs.innerHTML = '<span style="color:#60a5fa;">🚀 正在启动回放...</span>';
-    
+
     // 注入回放脚本
     try {
       console.log('注入 replay-inject.js...');
@@ -935,7 +1242,7 @@ async function startReplayInPage() {
       showToast('脚本注入失败，请刷新页面重试');
       return;
     }
-    
+
     // 发送回放指令
     var response = await chrome.tabs.sendMessage(tab.id, {
       action: 'startReplayScript',
@@ -944,19 +1251,20 @@ async function startReplayInPage() {
       highlight: true,
       fromIndex: 0
     });
-    
+
     console.log('回放启动响应:', response);
-    
+
     if (response && response.success) {
       isReplaying = true;
       isReplayPaused = false;
+      replayIsNavigating = false;
       updateReplayButtons(true);
       showToast('▶️ 回放开始');
       addReplayLog('🚀 开始回放，共 ' + replaySteps.length + ' 个步骤', 'start');
     } else {
       throw new Error('回放启动失败: ' + (response ? response.error : '未知错误'));
     }
-    
+
   } catch (error) {
     console.error('回放启动失败:', error);
     showToast('回放启动失败: ' + error.message);
@@ -980,9 +1288,9 @@ async function resumeReplayInPage() {
 
 async function stopReplayInPage() {
   var tab = await getCurrentTab();
-  
+
   // ✅ 设置全局停止标志（防止新页面自动恢复回放）
-  
+
   // 1. 发送停止消息到当前页面
   if (tab && tab.id) {
     try {
@@ -992,7 +1300,7 @@ async function stopReplayInPage() {
       console.log('发送停止消息失败:', e);
     }
   }
-  
+
   // 2. 清除所有页面的 sessionStorage 和回放状态
   try {
     var allTabs = await chrome.tabs.query({});
@@ -1010,17 +1318,17 @@ async function stopReplayInPage() {
             sessionStorage.removeItem('__replay_speed__');
             sessionStorage.removeItem('__replay_current_index__');
             sessionStorage.removeItem('__replay_injected__');
-            
+
             // 清理标记
             window.__replay_pending_checked__ = false;
             window.__replay_injected = false;
-            
+
             // 停止回放器
             if (window.__replayer) {
               window.__replayer.stop();
               window.__replayer = null;
             }
-            
+
             console.log('已清理页面回放状态');
           }
         });
@@ -1031,18 +1339,19 @@ async function stopReplayInPage() {
   } catch (e) {
     console.log('获取标签页失败:', e);
   }
-  
+
   // 3. 重置侧边栏状态
   isReplaying = false;
   isReplayPaused = false;
+  replayIsNavigating = false;
   stepResults = {};
   updateReplayButtons(false);
-  
+
   var pb = document.getElementById('replayProgressBar');
   var cs = document.getElementById('replayCurrentStep');
   if (pb) pb.style.width = '0%';
   if (cs) cs.innerHTML = '<span class="text-muted">回放已停止</span>';
-  
+
   addReplayLog('⏹️ 回放已完全停止，已清理所有页面状态', 'info');
   showToast('回放已停止');
 }
@@ -1071,7 +1380,7 @@ async function checkStatus() {
       startBtn.disabled = true;
       stopBtn.disabled = false;
       recordingIndicator.classList.remove('hidden');
-      
+
       var hRes = await chrome.runtime.sendMessage({ type: 'getActionHistory' });
       if (hRes && hRes.actionHistory) {
         actionHistory = hRes.actionHistory;
@@ -1079,7 +1388,7 @@ async function checkStatus() {
         updateStepCount();
         renderActionList(actionHistory);
       }
-      
+
       if (actionHistory.length > 0) {
         var last = actionHistory[0];
         if (last && last.timestamp) recordingStartTime = new Date(last.timestamp).getTime();
@@ -1104,7 +1413,7 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
   }
   _lastReceivedMessage[msgKey] = true;
   _lastMessageTime[msgKey] = now;
-  
+
   switch (request.type) {
     case 'actionHistoryUpdated':
       if (isRecording) {
@@ -1114,28 +1423,28 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
         renderActionList(actionHistory);
       }
       break;
-      
+
     case 'windowInfoUpdated':
       updateWindowInfo(request.data);
       break;
-      
+
     case 'urlChanged':
     case 'tabSwitched':
       updateUrlDisplay(request.data.url, request.data.title);
       break;
-      
+
     case 'recordingStopped':
       currentFileName = request.data.fileName;
       break;
-      
+
     case 'replayStepResult':
       handleReplayStepResult(request.data);
       break;
-      
+
     case 'replayStatus':
       handleReplayStatus(request.data);
       break;
-      
+
     case 'replayLog':
       // 只处理日志，不再额外添加
       var replayLogData = request.data || {};
@@ -1152,13 +1461,13 @@ function addReplayLogDirect(message, type) {
   type = type || 'info';
   var logContent = document.getElementById('replayLogContent');
   if (!logContent) return;
-  
+
   // ✅ 修复 [NaN] 问题：确保 message 是字符串
   if (message === undefined || message === null) {
     message = '未知消息';
   }
   message = String(message);
-  
+
   // 移除 [NaN] 前缀
   if (message.indexOf('[NaN]') !== -1) {
     message = message.replace('[NaN]', '');
@@ -1169,16 +1478,16 @@ function addReplayLogDirect(message, type) {
   if (firstEntry && firstEntry.textContent === '等待回放开始...') {
     logContent.innerHTML = '';
   }
-  
+
   var timeStr = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  
+
   var entry = document.createElement('div');
   entry.className = 'log-entry log-' + type;
   entry.innerHTML = '<span class="log-time">[' + timeStr + ']</span> ' + escapeHTML(message);
-  
+
   logContent.appendChild(entry);
   logContent.scrollTop = logContent.scrollHeight;
-  
+
   // 限制日志数量
   var entries = logContent.querySelectorAll('.log-entry');
   if (entries.length > 500) {
@@ -1201,35 +1510,44 @@ function handleReplayStepResult(data) {
     }
   }
   var stepKey = 'step_' + (data.stepNumber != null ? data.stepNumber : index) + '_' + data.success;
-  
+
   // 防止重复处理
   if (_processedStepResults[stepKey]) {
     console.log('忽略重复的步骤结果:', index);
     return;
   }
   _processedStepResults[stepKey] = true;
-  
+
   setTimeout(function() {
     delete _processedStepResults[stepKey];
   }, 3000);
-  
+
   // 更新步骤结果
   stepResults[index] = data.success ? 'success' : 'fail';
+  if (replaySteps[index]) {
+    replaySteps[index].assertionResults = Array.isArray(data.assertions) ? data.assertions : [];
+  }
   console.log('步骤结果更新: index=' + index + ', success=' + data.success);
-  
+
   // 更新卡片样式
   var cards = actionList.querySelectorAll('.action-card');
   if (cards[index]) {
     cards[index].classList.remove('replay-pending');
     cards[index].classList.add(data.success ? 'replay-success' : 'replay-fail');
-    
+
     var si = cards[index].querySelector('.replay-status-icon');
     if (si) {
       si.className = 'replay-status-icon ' + (data.success ? 'success' : 'fail');
       si.textContent = data.success ? '✅' : '❌';
     }
+    var oldAssertion = cards[index].querySelector('.assertion-summary');
+    if (oldAssertion) oldAssertion.remove();
+    if (replaySteps[index]) {
+      var assertionHTML = getAssertionSummary(replaySteps[index], true);
+      if (assertionHTML) cards[index].insertAdjacentHTML('beforeend', assertionHTML);
+    }
   }
-  
+
   // 更新进度条
   var pb = document.getElementById('replayProgressBar');
   if (pb && replaySteps.length > 0) {
@@ -1241,7 +1559,7 @@ function handleReplayStepResult(data) {
     pb.style.width = percent + '%';
     console.log('进度条: ' + completed + '/' + replaySteps.length + ' = ' + percent + '%');
   }
-  
+
   // ✅ 检查是否所有步骤都已完成
   var allCompleted = true;
   for (var i = 0; i < replaySteps.length; i++) {
@@ -1250,7 +1568,7 @@ function handleReplayStepResult(data) {
       break;
     }
   }
-  
+
   if (allCompleted && replaySteps.length > 0) {
     console.log('所有步骤已完成，更新最终UI');
     if (pb) pb.style.width = '100%';
@@ -1270,11 +1588,20 @@ function handleReplayStepResult(data) {
 var _processedStatus = {};
 var navigatingTimeout = null;
 var lastReplayStepCount = 0;
+var replayIsNavigating = false;
+
+function countCompletedReplaySteps() {
+  var completed = 0;
+  for (var i = 0; i < replaySteps.length; i++) {
+    if (stepResults[i] && stepResults[i] !== 'pending') completed++;
+  }
+  return completed;
+}
 
 function handleReplayStatus(data) {
   var pb = document.getElementById('replayProgressBar');
   var cs = document.getElementById('replayCurrentStep');
-  
+
   // 清除导航超时
   if (navigatingTimeout) {
     clearTimeout(navigatingTimeout);
@@ -1290,17 +1617,19 @@ function handleReplayStatus(data) {
   if (!_processedStatus) window._processedStatus = {};
   _processedStatus[statusKey] = true;
   setTimeout(function() { delete _processedStatus[statusKey]; }, 3000);
-  
+
   switch (data.status) {
     case 'started':
+      replayIsNavigating = false;
       if (pb) pb.style.width = '0%';
       if (cs) cs.innerHTML = '<span style="color:#60a5fa;">🚀 开始回放...</span>';
       // ✅ 清空 sessionStorage 中的残留数据
       clearReplayStorage();
       lastReplayStepCount = 0;
       break;
-     
+
     case 'executing':
+      replayIsNavigating = false;
       if (cs && data.step) {
         cs.innerHTML = '<span style="color:#60a5fa;">▶️ 步骤 ' + data.step + '/' + data.total + '</span>';
         lastReplayStepCount = data.step;
@@ -1308,6 +1637,10 @@ function handleReplayStatus(data) {
       break;
 
     case 'completed':
+      if (replaySteps.length > 0 && (replayIsNavigating || countCompletedReplaySteps() < replaySteps.length)) {
+        console.log('忽略过早完成状态: completed=' + countCompletedReplaySteps() + '/' + replaySteps.length + ', navigating=' + replayIsNavigating);
+        break;
+      }
       if (navigatingTimeout) clearTimeout(navigatingTimeout);
       for (var completedIndex = 0; completedIndex < replaySteps.length; completedIndex++) {
         if (!stepResults[completedIndex] || stepResults[completedIndex] === 'pending') {
@@ -1328,7 +1661,7 @@ function handleReplayStatus(data) {
       window._lastCompleteTime = Date.now();
       addReplayLog('✅ 回放完成', 'complete');
       break;
-      
+
     case 'paused':
       if (cs) cs.innerHTML = '<span style="color:#f59e0b;">⏸️ 已暂停 - 步骤 ' + data.step + '/' + data.total + '</span>';
       isReplaying = false;
@@ -1336,7 +1669,7 @@ function handleReplayStatus(data) {
       updateReplayButtons(false);
       addReplayLog('⏸️ 回放已暂停', 'pause');
       break;
-      
+
     case 'resumed':
       if (cs) cs.innerHTML = '<span style="color:#60a5fa;">▶️ 继续回放...</span>';
       isReplaying = true;
@@ -1345,14 +1678,20 @@ function handleReplayStatus(data) {
       addReplayLog('▶️ 回放已恢复', 'start');
       renderReplayList();
       break;
-      
+
     case 'navigating':
+      replayIsNavigating = true;
       if (cs) cs.innerHTML = '<span style="color:#f59e0b;">🔄 正在跳转页面...</span>';
       addReplayLog('🔄 页面跳转中...', 'navigate');
       console.log('等待新页面加载并恢复回放');
       break;
-      
+
     case 'stopped':
+      if (isReplaying && countCompletedReplaySteps() === 0) {
+        console.log('忽略新回放启动时的旧 stopped 状态');
+        break;
+      }
+      replayIsNavigating = false;
       if (cs) cs.innerHTML = '<span class="text-muted">回放已停止</span>';
       isReplaying = false;
       isReplayPaused = false;
@@ -1367,7 +1706,7 @@ function handleReplayStatus(data) {
 function checkReplayCompletion() {
   chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
     if (!tabs[0]) return;
-    
+
     chrome.scripting.executeScript({
       target: { tabId: tabs[0].id },
       func: function() {
@@ -1453,15 +1792,15 @@ function bindReplayEvents() {
       addReplayLog('日志已清空', 'info');
     });
   }
-  
+
   if (importBtn) importBtn.addEventListener('click', importFile);
   if (fileInput) fileInput.addEventListener('change', handleFileSelect);
   if (closeReplayBtn) closeReplayBtn.addEventListener('click', closeReplayPanel);
-  
+
   if (replayPlayBtn) replayPlayBtn.addEventListener('click', function() { if (isReplayPaused) resumeReplayInPage(); else startReplayInPage(); });
   if (replayPauseBtn) replayPauseBtn.addEventListener('click', pauseReplayInPage);
   if (replayStopBtn) replayStopBtn.addEventListener('click', stopReplayInPage);
-  
+
   document.querySelectorAll('.speed-btn').forEach(function(b) {
     b.addEventListener('click', function() { setReplaySpeed(parseFloat(b.dataset.speed)); });
   });

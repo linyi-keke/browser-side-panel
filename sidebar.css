@@ -574,6 +574,50 @@ body {
 .btn-card-action:hover { background: rgba(148, 163, 184, 0.2); }
 .btn-card-edit:hover { color: #60a5fa; }
 .btn-card-delete:hover { color: #ef4444; background: rgba(239, 68, 68, 0.1); }
+.btn-card-assert:hover { color: #fbbf24; background: rgba(245, 158, 11, 0.12); }
+.card-actions.always-visible { opacity: 1; }
+
+.assertion-summary {
+  margin-top: 8px;
+  padding: 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: rgba(15, 23, 42, 0.45);
+}
+.assertion-summary-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: #cbd5e1;
+  margin-bottom: 6px;
+}
+.assertion-summary.passed { border-color: rgba(52, 211, 153, 0.35); background: rgba(16, 185, 129, 0.08); }
+.assertion-summary.failed { border-color: rgba(239, 68, 68, 0.38); background: rgba(239, 68, 68, 0.08); }
+.assertion-summary.skipped { opacity: 0.7; }
+.assertion-items { display: flex; flex-direction: column; gap: 5px; }
+.assertion-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 10px;
+  color: #94a3b8;
+}
+.assertion-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-top: 4px;
+  background: #64748b;
+  flex-shrink: 0;
+}
+.assertion-item.passed .assertion-dot { background: #34d399; }
+.assertion-item.failed .assertion-dot { background: #ef4444; }
+.assertion-item.skipped .assertion-dot { background: #94a3b8; opacity: 0.45; }
+.assertion-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.assertion-text strong { color: #e2e8f0; font-weight: 600; }
+.assertion-actual { color: #60a5fa; word-break: break-all; }
+.assertion-error { color: #fca5a5; word-break: break-all; }
 
 /* ==================== 回放状态样式 ==================== */
 .action-card.replay-pending { opacity: 0.6; border-left: 3px solid #64748b !important; }
@@ -702,6 +746,7 @@ body {
 }
 .form-input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2); }
 .form-input::placeholder { color: #64748b; }
+.form-input.form-input-error { border-color: #ef4444; box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.16); }
 
 .form-textarea { resize: vertical; min-height: 40px; }
 .form-hint { display: block; font-size: 10px; color: #64748b; margin-top: 4px; }
@@ -719,6 +764,42 @@ body {
 .coord-edit-item { flex: 1; }
 .coord-label { display: block; font-size: 10px; color: #64748b; margin-bottom: 2px; text-transform: uppercase; }
 .form-input-small { width: 100%; padding: 6px 8px !important; }
+
+.assertion-dialog { max-width: 390px; }
+.assertion-edit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.assertion-edit-row {
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.assertion-row-top {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+}
+.assertion-enabled {
+  display: flex !important;
+  align-items: center;
+  gap: 4px;
+  margin: 0 !important;
+  white-space: nowrap;
+}
+.btn-assertion-add {
+  width: 100%;
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.24);
+}
 
 /* ==================== Toast ==================== */
 .toast {

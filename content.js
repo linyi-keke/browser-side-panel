@@ -406,7 +406,7 @@ var pendingInputTimers = new Map();
       var wasRecording = isRecording;
       isRecording = request.isRecording;
       
-      if (!wasRecording && isRecording) recordNavigationStep();
+      if (!wasRecording && isRecording && !request.suppressInitialNavigation) recordNavigationStep();
       if (!isRecording) inputValueTracker.clear();
       
       console.log('录制状态:', isRecording ? '录制中' : '已停止');
