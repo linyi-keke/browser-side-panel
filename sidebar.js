@@ -32,7 +32,9 @@ var assertionTypeMap = {
   elementNotExists: '元素不存在',
   urlContains: 'URL包含',
   elementTextContains: '元素文本包含',
-  elementTextEquals: '元素文本等于'
+  elementTextEquals: '元素文本等于',
+  regionTextContains: '\u533a\u57df\u6587\u672c\u5305\u542b',
+  regionTextNotContains: '\u533a\u57df\u6587\u672c\u4e0d\u5305\u542b'
 };
 
 var typeMap = {
@@ -194,12 +196,15 @@ async function startRecording() {
     currentPageTitle = tab.title;
     updateUrlDisplay(tab.url, tab.title);
     var startsOnRestrictedPage = isRestrictedTabUrl(tab.url);
-    var initialSourceSteps = replaySteps.length ? replaySteps : continuationSteps;
-    var initialSteps = cloneStepsForRecording(initialSourceSteps);
+    var initialSteps = [];
 
     await chrome.runtime.sendMessage({ type: 'clearHistory' });
-    actionHistory = initialSteps.length ? [].concat(initialSteps).reverse() : [];
-    stepCounter = initialSteps.length;
+    actionHistory = [];
+    replaySteps = [];
+    continuationSteps = [];
+    continuationSessionId = null;
+    currentReplaySessionId = null;
+    stepCounter = 0;
     stepResults = {};
     updateStepCount();
     renderActionList(actionHistory);
@@ -486,6 +491,65 @@ function cloneStepsForRecording(steps) {
   });
 }
 
+function getAssertionRegionLabel(region) {
+  if (!region) return '';
+  return 'Region ' + Math.round(region.width || 0) + 'x' + Math.round(region.height || 0) +
+    ' @ ' + Math.round(region.left || 0) + ',' + Math.round(region.top || 0);
+}
+
+async function sendAssertionRegionSelectRequest() {
+  var tab = await getCurrentTab();
+  if (!tab || !tab.id) throw new Error('无法获取当前标签页');
+
+  try {
+    return await chrome.tabs.sendMessage(tab.id, {
+      action: 'startAssertionRegionSelect',
+      options: {}
+    });
+  } catch (firstError) {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['content.js']
+    });
+    await new Promise(function(r) { setTimeout(r, 200); });
+    return await chrome.tabs.sendMessage(tab.id, {
+      action: 'startAssertionRegionSelect',
+      options: {}
+    });
+  }
+}
+
+async function captureAssertionRegion(row) {
+  if (!row) return;
+  var typeEl = row.querySelector('.assertion-type');
+  var expectedEl = row.querySelector('.assertion-expected');
+  var selectorEl = row.querySelector('.assertion-selector');
+  var regionInfo = row.querySelector('.assertion-region-info');
+
+  showToast('请在页面中拖拽选择断言区域');
+  try {
+    var response = await sendAssertionRegionSelectRequest();
+    if (!response || !response.success || !response.data) {
+      showToast((response && response.error) || '区域选择已取消');
+      return;
+    }
+    var data = response.data;
+    row.dataset.region = JSON.stringify(data.region || {});
+    if (typeEl && ['regionTextContains', 'regionTextNotContains'].indexOf(typeEl.value) === -1) {
+      typeEl.value = 'regionTextContains';
+    }
+    if (expectedEl && !expectedEl.value.trim()) expectedEl.value = (data.text || '').substring(0, 300);
+    if (selectorEl && !selectorEl.value.trim()) selectorEl.value = data.selector || '';
+    if (regionInfo) {
+      regionInfo.textContent = getAssertionRegionLabel(data.region) + (data.text ? ' | ' + data.text.substring(0, 80) : '');
+      regionInfo.classList.remove('hidden');
+    }
+    showToast('区域断言已生成');
+  } catch (error) {
+    showToast('区域选择失败: ' + error.message);
+  }
+}
+
 function addAssertionRow(assertion) {
   assertion = assertion || createDefaultAssertion();
   var rows = document.getElementById('assertionRows');
@@ -503,6 +567,8 @@ function addAssertionRow(assertion) {
         '<option value="urlContains">URL包含</option>' +
         '<option value="elementTextContains">元素文本包含</option>' +
         '<option value="elementTextEquals">元素文本等于</option>' +
+        '<option value="regionTextContains">\u533a\u57df\u6587\u672c\u5305\u542b</option>' +
+        '<option value="regionTextNotContains">\u533a\u57df\u6587\u672c\u4e0d\u5305\u542b</option>' +
       '</select>' +
       '<label class="assertion-enabled"><input type="checkbox" class="assertion-enabled-input"> 启用</label>' +
       '<button type="button" class="btn-card-action btn-assertion-remove" title="删除断言">×</button>' +
@@ -511,9 +577,19 @@ function addAssertionRow(assertion) {
     '<input class="form-input assertion-expected" placeholder="期望文本 / URL 片段" value="' + escapeHTML(assertion.expected || assertion.target || '') + '">' +
     '<input class="form-input assertion-timeout" type="number" min="0" step="500" placeholder="超时(ms)" value="' + escapeHTML(String(assertion.timeout == null ? 2000 : assertion.timeout)) + '">';
 
+  var timeoutInput = row.querySelector('.assertion-timeout');
+  var regionRow = document.createElement('div');
+  regionRow.className = 'assertion-region-row';
+  regionRow.innerHTML =
+    '<button type="button" class="btn btn-assertion-pick">\u6846\u9009\u9875\u9762\u533a\u57df</button>' +
+    '<span class="assertion-region-info' + (assertion.region ? '' : ' hidden') + '">' + escapeHTML(getAssertionRegionLabel(assertion.region)) + '</span>';
+  row.insertBefore(regionRow, timeoutInput);
+
   row.querySelector('.assertion-type').value = assertion.type || 'textVisible';
+  if (assertion.region) row.dataset.region = JSON.stringify(assertion.region);
   row.querySelector('.assertion-enabled-input').checked = assertion.enabled !== false;
   row.querySelector('.btn-assertion-remove').addEventListener('click', function() { row.remove(); });
+  row.querySelector('.btn-assertion-pick').addEventListener('click', function() { captureAssertionRegion(row); });
   rows.appendChild(row);
 }
 
@@ -527,8 +603,17 @@ function collectAssertionRows() {
     var expected = row.querySelector('.assertion-expected').value.trim();
     var timeout = parseInt(row.querySelector('.assertion-timeout').value, 10);
     var enabled = row.querySelector('.assertion-enabled-input').checked;
-    var needsExpected = ['textVisible', 'urlContains', 'elementTextContains', 'elementTextEquals'].indexOf(type) !== -1;
+    var region = null;
+    if (row.dataset.region) {
+      try {
+        region = JSON.parse(row.dataset.region);
+      } catch (e) {
+        region = null;
+      }
+    }
+    var needsExpected = ['textVisible', 'urlContains', 'elementTextContains', 'elementTextEquals', 'regionTextContains', 'regionTextNotContains'].indexOf(type) !== -1;
     var needsSelector = ['elementExists', 'elementNotExists', 'elementTextContains', 'elementTextEquals'].indexOf(type) !== -1;
+    var needsRegion = ['regionTextContains', 'regionTextNotContains'].indexOf(type) !== -1;
 
     if (needsExpected && !expected) {
       errors.push('第 ' + (rowIndex + 1) + ' 条断言缺少期望内容');
@@ -544,14 +629,21 @@ function collectAssertionRows() {
     }
     row.querySelector('.assertion-selector').classList.remove('form-input-error');
 
-    assertions.push({
+    if (needsRegion && (!region || !region.width || !region.height)) {
+      errors.push('第 ' + (rowIndex + 1) + ' 条区域断言缺少框选区域');
+      return;
+    }
+
+    var assertionData = {
       id: row.dataset.id || createDefaultAssertion().id,
       type: type,
       selector: selector,
       expected: expected,
       enabled: enabled,
       timeout: isNaN(timeout) ? 2000 : Math.max(0, timeout)
-    });
+    };
+    if (region) assertionData.region = region;
+    assertions.push(assertionData);
   });
   return { assertions: assertions, errors: errors };
 }
@@ -910,7 +1002,7 @@ async function confirmExport() {
 
   // 需要先反转成正常顺序再处理
   var exportSourceSteps = getExportSourceSteps();
-  var reversedHistory = replaySteps && replaySteps.length ? [].concat(exportSourceSteps) : [].concat(exportSourceSteps).reverse();
+  var reversedHistory = replaySteps && replaySteps.length ? normalizeReplaySteps(exportSourceSteps) : normalizeReplaySteps([].concat(exportSourceSteps).reverse());
 
   for (var i = 0; i < reversedHistory.length; i++) {
     var action = reversedHistory[i];
@@ -982,11 +1074,8 @@ function normalizeReplaySteps(steps) {
   steps = (steps || []).filter(function(s) { return s && s.type; }).map(function(step) {
     return Object.assign({}, step, { target: Object.assign({}, step.target || {}) });
   });
-  steps.sort(function(a, b) {
-    var numA = a.stepNumber || 999;
-    var numB = b.stepNumber || 999;
-    return numA - numB;
-  });
+  steps.sort(function(a, b) { return getStepSortValue(a, 0) - getStepSortValue(b, 0); });
+  steps = mergeDuplicateNavigationSteps(steps);
   steps.forEach(function(step, i) {
     step.stepNumber = i + 1;
     step.assertionResults = [];
@@ -997,6 +1086,61 @@ function normalizeReplaySteps(steps) {
     if (!step.target.tagName) step.target.tagName = '';
   });
   return steps;
+}
+
+function getStepSortValue(step, fallbackIndex) {
+  if (step && step.timeOffset != null && !isNaN(Number(step.timeOffset))) return Number(step.timeOffset);
+  if (step && step.timestamp) {
+    var ts = new Date(step.timestamp).getTime();
+    if (!isNaN(ts)) return ts;
+  }
+  if (step && step.stepNumber != null && !isNaN(Number(step.stepNumber))) return Number(step.stepNumber);
+  return fallbackIndex || 0;
+}
+
+function normalizeUrlForCompare(url) {
+  if (!url) return '';
+  try {
+    var parsed = new URL(url);
+    parsed.hash = '';
+    return parsed.href;
+  } catch (e) {
+    return String(url || '').split('#')[0];
+  }
+}
+
+function mergeAssertions(targetStep, sourceStep) {
+  var existing = Array.isArray(targetStep.assertions) ? targetStep.assertions : [];
+  var incoming = Array.isArray(sourceStep.assertions) ? sourceStep.assertions : [];
+  if (incoming.length === 0) return;
+  var seen = {};
+  existing.forEach(function(item) {
+    if (item && item.id) seen[item.id] = true;
+  });
+  incoming.forEach(function(item) {
+    if (!item) return;
+    if (item.id && seen[item.id]) return;
+    existing.push(Object.assign({}, item));
+    if (item.id) seen[item.id] = true;
+  });
+  targetStep.assertions = existing;
+}
+
+function mergeDuplicateNavigationSteps(steps) {
+  var result = [];
+  for (var i = 0; i < steps.length; i++) {
+    var step = steps[i];
+    var previous = result[result.length - 1];
+    var sameNavigation = previous && previous.type === 'navigation' && step.type === 'navigation' &&
+      normalizeUrlForCompare(previous.url || previous.pageUrl) === normalizeUrlForCompare(step.url || step.pageUrl);
+    var closeInTime = Math.abs(getStepSortValue(step, i) - getStepSortValue(previous, i - 1)) <= 1500;
+    if (sameNavigation && closeInTime) {
+      mergeAssertions(previous, step);
+      continue;
+    }
+    result.push(step);
+  }
+  return result;
 }
 
 function importFile() {
@@ -1207,15 +1351,9 @@ async function startReplayInPage() {
     await new Promise(function(r) { setTimeout(r, 500); });
 
     // 排序步骤
-    replaySteps.sort(function(a, b) {
-      return (a.stepNumber || 0) - (b.stepNumber || 0);
-    });
+    replaySteps = normalizeReplaySteps(replaySteps);
 
     // 重新编号
-    replaySteps.forEach(function(step, idx) {
-      step.stepNumber = idx + 1;
-      step.assertionResults = [];
-    });
 
     stepResults = {};
     replaySteps.forEach(function(_, i) { stepResults[i] = 'pending'; });

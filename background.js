@@ -177,6 +177,17 @@ async function syncCurrentSessionActionFromHistory(historyIndex, historyItem) {
   await chrome.storage.local.set({ sessions: recordingSessions });
 }
 
+async function deleteCurrentSessionActionFromHistoryIndex(historyIndex) {
+  if (!currentSessionId || !recordingSessions[currentSessionId]) return;
+  var actions = recordingSessions[currentSessionId].actions || [];
+  var actionIndex = actions.length - 1 - historyIndex;
+  if (actionIndex < 0 || actionIndex >= actions.length) return;
+  actions.splice(actionIndex, 1);
+  recordingSessions[currentSessionId].actions = actions;
+  await saveSessionToStorage(currentSessionId);
+  await chrome.storage.local.set({ sessions: recordingSessions });
+}
+
 async function startRecording(url, title, tabId, initialActions) {
   await stateReady;
   currentSessionId = generateSessionId();
@@ -523,6 +534,7 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
             dsHistory.splice(request.index, 1);
             dsHistory.forEach(function(action, i) { action.stepNumber = dsHistory.length - i; });
             await chrome.storage.local.set({ actionHistory: dsHistory });
+            await deleteCurrentSessionActionFromHistoryIndex(request.index);
           }
           sendResponse({ success: true });
           break;

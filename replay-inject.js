@@ -208,6 +208,71 @@
     return this.normalizeText(document.body ? document.body.innerText || document.body.textContent : '').indexOf(expected) >= 0;
   };
 
+  ActionReplayer.prototype.getRegionText = function(region) {
+    if (!region || !document.body) return '';
+    var left = Number(region.left) || 0;
+    var top = Number(region.top) || 0;
+    var width = Number(region.width) || 0;
+    var height = Number(region.height) || 0;
+    if (width <= 0 || height <= 0) return '';
+
+    var right = left + width;
+    var bottom = top + height;
+    var chunks = [];
+    var seen = {};
+
+    function rectIntersects(rect) {
+      var pageLeft = rect.left + window.scrollX;
+      var pageTop = rect.top + window.scrollY;
+      var pageRight = pageLeft + rect.width;
+      var pageBottom = pageTop + rect.height;
+      return !(pageRight < left || pageLeft > right || pageBottom < top || pageTop > bottom);
+    }
+
+    function addText(text) {
+      text = String(text || '').replace(/\s+/g, ' ').trim();
+      if (!text || seen[text]) return;
+      seen[text] = true;
+      chunks.push(text);
+    }
+
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+      acceptNode: function(node) {
+        if (!String(node.nodeValue || '').replace(/\s+/g, ' ').trim()) return NodeFilter.FILTER_REJECT;
+        var parent = node.parentElement;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        var style = window.getComputedStyle(parent);
+        if (!style || style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    while (walker.nextNode()) {
+      var range = document.createRange();
+      range.selectNodeContents(walker.currentNode);
+      var rects = range.getClientRects();
+      for (var i = 0; i < rects.length; i++) {
+        if (rectIntersects(rects[i])) {
+          addText(walker.currentNode.nodeValue);
+          break;
+        }
+      }
+      range.detach();
+    }
+
+    var fields = document.body.querySelectorAll('input, textarea, select');
+    Array.prototype.forEach.call(fields, function(el) {
+      if (!el || !el.getBoundingClientRect) return;
+      var style = window.getComputedStyle(el);
+      if (!style || style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return;
+      var rect = el.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0 || !rectIntersects(rect)) return;
+      addText(el.value || el.placeholder || '');
+    });
+
+    return this.normalizeText(chunks.join(' '));
+  };
+
   ActionReplayer.prototype.evaluateAssertionOnce = function(assertion) {
     var type = assertion.type || 'textVisible';
     var expected = assertion.expected || assertion.target || '';
@@ -238,6 +303,14 @@
     if (type === 'elementTextEquals') {
       actual = this.getElementText(element);
       return { passed: !!element && actual === this.normalizeText(expected), actual: element ? actual : '未找到元素' };
+    }
+    if (type === 'regionTextContains') {
+      actual = this.getRegionText(assertion.region);
+      return { passed: actual.indexOf(this.normalizeText(expected)) >= 0, actual: actual || 'No text in selected region' };
+    }
+    if (type === 'regionTextNotContains') {
+      actual = this.getRegionText(assertion.region);
+      return { passed: actual.indexOf(this.normalizeText(expected)) < 0, actual: actual || 'No text in selected region' };
     }
     return { passed: false, actual: '', error: 'Unknown assertion type: ' + type };
   };
@@ -388,23 +461,18 @@
         return true;
       }
 
-      var remainingSteps = [];
+      var remainingSteps = [step];
       for (var i = this.currentIndex + 1; i < this.steps.length; i++) {
         remainingSteps.push(this.steps[i]);
       }
 
-      if (remainingSteps.length > 0) {
-        await savePendingReplay({
-          steps: remainingSteps,
-          speed: this.speed,
-          currentIndex: 0,
-          totalSteps: this.steps.length
-        });
-        console.log('保存剩余步骤:', remainingSteps.length);
-      } else {
-        await clearPendingReplay();
-        sendUniqueMessage('replayStatus', { status: 'completed', total: this.steps.length }, 'complete');
-      }
+      await savePendingReplay({
+        steps: remainingSteps,
+        speed: this.speed,
+        currentIndex: 0,
+        totalSteps: this.steps.length
+      });
+      console.log('Saved remaining steps:', remainingSteps.length);
 
       sendUniqueMessage('replayStatus', { status: 'navigating', url: url }, 'nav');
       this.isReplaying = false;
@@ -542,7 +610,9 @@
       element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: centerX, clientY: centerY, view: window }));
       element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: centerX, clientY: centerY, view: window }));
       element.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: centerX, clientY: centerY, view: window }));
-      element.click();
+      if (typeof element.click === 'function') {
+        element.click();
+      }
       this.createHighlight(centerX, centerY);
       this.log('Click succeeded at (' + Math.round(centerX) + ', ' + Math.round(centerY) + ') on ' + describeElement(element), 'success', step);
       console.log('点击成功:', element.tagName, element.className);
@@ -783,7 +853,7 @@ console.log('重置 checkPendingReplay 标记');
 (async function checkPendingReplay() {
   sendReplayLog('Pending replay check started on ' + window.location.href, 'info');
   console.log('checkPendingReplay 开始执行');
-  
+
   // 检查全局停止标志
   try {
     var globalStop = localStorage.getItem('__replay_global_stop__');
@@ -793,36 +863,36 @@ console.log('重置 checkPendingReplay 标记');
       return;
     }
   } catch (e) {}
-  
+
   var pendingData = await getPendingReplay();
   if (!pendingData) {
     console.log('没有待回放的步骤');
     return;
   }
-  
+
   if (typeof pendingData !== 'string') pendingData = JSON.stringify(pendingData);
   console.log('发现待回放步骤:', pendingData.substring(0, 200));
-  
+
   try {
     var data = JSON.parse(pendingData);
     var steps = data.steps || [];
     var speed = data.speed || 1;
     sendReplayLog('Pending replay data found: steps=' + steps.length + ', speed=' + speed, 'navigate');
-    
+
     console.log('待回放步骤数量:', steps.length);
-    
+
     // ✅ 关键修复：立即清除，防止重复
     await clearPendingReplay();
-    
+
     if (steps.length === 0) {
       console.log('剩余步骤为空');
       return;
     }
-    
+
     // 过滤已执行的导航步骤
     var currentUrl = window.location.href;
     var filteredSteps = [];
-    
+
     for (var i = 0; i < steps.length; i++) {
       var step = steps[i];
       if (step.type === 'navigation') {
@@ -837,50 +907,61 @@ console.log('重置 checkPendingReplay 标记');
         }
         if (skip) {
           console.log('跳过已加载的导航步骤:', targetUrl);
+          var skipStartTime = Date.now();
+          var skipAssertionRun = await (new ActionReplayer([])).runAssertions(step);
+          var skipSuccess = skipAssertionRun.success;
+          sendUniqueMessage('replayStepResult', {
+            index: i,
+            stepNumber: step.stepNumber,
+            success: skipSuccess,
+            duration: Date.now() - skipStartTime,
+            assertions: skipAssertionRun.results
+          }, 'skip_nav_result_' + (step.stepNumber || i));
+          sendReplayLog('Skipped already-loaded navigation step; marked ' + (skipSuccess ? 'success' : 'fail'), skipSuccess ? 'success' : 'fail', step);
           continue;
         }
       }
       filteredSteps.push(step);
     }
-    
+
     console.log('过滤后步骤数量:', filteredSteps.length);
-    
+
     if (filteredSteps.length === 0) {
       console.log('所有步骤都已执行，发送完成');
       sendUniqueMessage('replayStatus', { status: 'completed', total: data.totalSteps || steps.length }, 'complete_pending');
       sendReplayLog('All pending steps filtered out; sending completed status', 'complete');
       return;
     }
-    
+
     // 重新编号
     // 延迟执行，确保页面稳定
     setTimeout(function() {
       sendReplayLog('Resume replay after navigation: filteredSteps=' + filteredSteps.length, 'navigate');
       console.log('开始恢复回放，执行步骤:', filteredSteps.length);
-      
+
       if (window.__replayer) {
         window.__replayer.stop(true);
         window.__replayer = null;
       }
-      
+
       var replayer = new ActionReplayer(filteredSteps);
       replayer.speed = speed;
       replayer.highlightEnabled = true;
       window.__replayer = replayer;
-      
+
       // 发送恢复状态
       sendUniqueMessage('replayStatus', {
         status: 'resumed',
         step: 1,
         total: filteredSteps.length
       }, 'resumed');
-      
+
       // 开始回放
       setTimeout(function() {
         replayer.startReplay(0);
       }, 500);
     }, 1000);
-    
+
   } catch (e) {
     console.error('恢复回放失败:', e);
     await clearPendingReplay();

@@ -765,13 +765,31 @@ body {
 .coord-label { display: block; font-size: 10px; color: #64748b; margin-bottom: 2px; text-transform: uppercase; }
 .form-input-small { width: 100%; padding: 6px 8px !important; }
 
-.assertion-dialog { max-width: 390px; }
+.assertion-dialog {
+  max-width: 390px;
+  max-height: min(82vh, 720px);
+  display: flex;
+  flex-direction: column;
+}
+.assertion-dialog .dialog-body {
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
 .assertion-edit-list {
   display: flex;
   flex-direction: column;
   gap: 10px;
   margin-bottom: 12px;
+  min-height: 0;
+  max-height: min(46vh, 430px);
+  overflow-y: auto;
+  padding-right: 4px;
 }
+.assertion-edit-list::-webkit-scrollbar { width: 4px; }
+.assertion-edit-list::-webkit-scrollbar-track { background: transparent; }
+.assertion-edit-list::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.28); border-radius: 3px; }
 .assertion-edit-row {
   padding: 10px;
   border: 1px solid rgba(148, 163, 184, 0.16);
@@ -800,6 +818,29 @@ body {
   color: #fbbf24;
   border: 1px solid rgba(245, 158, 11, 0.24);
 }
+.assertion-region-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.btn-assertion-pick {
+  flex: 0 0 auto;
+  padding: 6px 9px;
+  font-size: 11px;
+  background: rgba(96, 165, 250, 0.12);
+  color: #93c5fd;
+  border: 1px solid rgba(96, 165, 250, 0.25);
+}
+.assertion-region-info {
+  min-width: 0;
+  color: #94a3b8;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.assertion-region-info.hidden { display: none; }
 
 /* ==================== Toast ==================== */
 .toast {

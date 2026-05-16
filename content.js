@@ -1,7 +1,7 @@
 // content.js - 负责在页面中监听用户操作、收集窗口信息、发送消息给 background.js，并处理回放脚本的注入和通信
 (function() {
   'use strict';
-  
+
   var windowInfo = {
     windowWidth: window.innerWidth,
     windowHeight: window.innerHeight,
@@ -9,16 +9,18 @@
     viewportHeight: document.documentElement.clientHeight,
     devicePixelRatio: window.devicePixelRatio
   };
-  
+
   var isRecording = false;
   var scrollTimer = null;
   var lastResizeTime = 0;
   var lastScrollAction = null;
   var inputValueTracker = new Map();
-  
-  console.log('操作追踪器 Content Script 已加载');
-  
-  // 更新并发送窗口信息
+  var assertionSelectActive = false;
+  var assertionSelectState = null;
+  var assertionSuppressEventsUntil = 0;
+  var userScrollUntil = 0;
+  console.log('Content Script initialized');
+  // update window info
   function updateAndNotifyWindowInfo() {
     windowInfo = {
       windowWidth: window.innerWidth,
@@ -27,40 +29,38 @@
       viewportHeight: document.documentElement.clientHeight,
       devicePixelRatio: window.devicePixelRatio
     };
-    
+
     chrome.runtime.sendMessage({
       type: 'updateWindowInfo',
       data: windowInfo
     }).catch(function() {});
-    
+
     return windowInfo;
   }
-  
-  // 发送操作
+  // send action
   function sendAction(actionData) {
     if (!isRecording) return;
-    
+
     chrome.runtime.sendMessage({
       type: 'recordAction',
       data: actionData
     }).catch(function() {});
   }
-  
-  // 获取元素选择器
+  // get element selector
   function getElementSelector(el) {
     if (!el || el === document.body || el === document.documentElement) return '';
-    
+
     if (el.id) return '#' + CSS.escape(el.id);
-    
+
     if (el.name) return el.tagName.toLowerCase() + '[name="' + CSS.escape(el.name) + '"]';
-    
+
     var selector = el.tagName.toLowerCase();
-    
+
     if (el.className && typeof el.className === 'string') {
       var classes = el.className.trim().split(/\s+/).filter(function(c) { return c && c.indexOf(':') === -1; });
       if (classes.length > 0) selector += '.' + classes.slice(0, 2).map(function(c) { return CSS.escape(c); }).join('.');
     }
-    
+
     if (el.parentElement) {
       var siblings = Array.from(el.parentElement.children).filter(function(child) { return child.tagName === el.tagName; });
       if (siblings.length > 1) {
@@ -68,21 +68,21 @@
         selector += ':nth-of-type(' + index + ')';
       }
     }
-    
+
     return selector;
   }
-  
-  // 发送滚动位置
+  // send scroll position
   function sendScrollPosition() {
     if (!isRecording) return;
-    
+    if (assertionSelectActive || Date.now() < assertionSuppressEventsUntil) return;
+
     windowInfo = Object.assign({}, windowInfo, {
       viewportWidth: document.documentElement.clientWidth,
       viewportHeight: document.documentElement.clientHeight,
       windowWidth: window.innerWidth,
       windowHeight: window.innerHeight
     });
-    
+
     var actionData = {
       type: 'scroll',
       scrollX: window.scrollX,
@@ -93,39 +93,305 @@
       windowHeight: windowInfo.windowHeight,
       timestamp: new Date().toISOString()
     };
-    
+
     if (lastScrollAction && lastScrollAction.scrollX === actionData.scrollX && lastScrollAction.scrollY === actionData.scrollY) return;
-    
+
     lastScrollAction = actionData;
     sendAction(actionData);
   }
-  
-  // 获取元素文本
-  function getElementText(el) {
-    if (!el) return '';
-    
-    var tagName = (el.tagName || '').toUpperCase();
-    
-    if (tagName === 'INPUT' || tagName === 'TEXTAREA') return (el.value || el.placeholder || '').substring(0, 100);
-    if (tagName === 'IMG') return (el.alt || el.title || '').substring(0, 100);
-    if (tagName === 'A' || tagName === 'BUTTON') return (el.textContent || el.innerText || '').trim().substring(0, 100);
-    if (el.textContent) return el.textContent.trim().substring(0, 100);
-    
-    return '';
+
+  function markUserScrollIntent() {
+    userScrollUntil = Date.now() + 1200;
   }
-  
+
+  // 获取元素文本
+  function normalizeElementText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function getAccessibleText(el) {
+    if (!el) return '';
+
+    var tagName = (el.tagName || '').toUpperCase();
+
+    if (tagName === 'INPUT' || tagName === 'TEXTAREA') {
+      return normalizeElementText(el.value || el.placeholder || el.getAttribute('aria-label') || '');
+    }
+
+    if (tagName === 'IMG') {
+      return normalizeElementText(el.alt || el.title || el.getAttribute('aria-label') || '');
+    }
+
+    return normalizeElementText(
+      el.getAttribute('aria-label') ||
+      el.getAttribute('title') ||
+      el.innerText ||
+      el.textContent ||
+      el.value ||
+      ''
+    );
+  }
+
+  function getElementText(el) {
+    return getAccessibleText(el).substring(0, 100);
+  }
+
+  function isSemanticClickTarget(el) {
+    if (!el || !el.tagName || el === document.body || el === document.documentElement) return false;
+
+    var tagName = (el.tagName || '').toUpperCase();
+    var role = String(el.getAttribute('role') || '').toLowerCase();
+
+    if (tagName === 'A' || tagName === 'BUTTON' || tagName === 'SUMMARY' || tagName === 'LABEL') return true;
+    if (['button', 'link', 'tab', 'menuitem', 'option'].indexOf(role) !== -1) return true;
+    if (el.hasAttribute('href') || el.hasAttribute('onclick')) return true;
+    if (/^(YT-|YTD-|TP-YT-)/.test(tagName) && getAccessibleText(el)) return true;
+
+    return false;
+  }
+
+  function getActionTarget(event) {
+    var target = event && event.target;
+    if (!target || !target.tagName) return target;
+    if (isEditableElement(target)) return target;
+
+    var path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    var fallback = getAccessibleText(target) ? target : null;
+
+    for (var i = 0; i < path.length; i++) {
+      var el = path[i];
+      if (!el || !el.tagName || el === document.body || el === document.documentElement) continue;
+      if (!fallback && getAccessibleText(el)) fallback = el;
+      if (isSemanticClickTarget(el) && getAccessibleText(el)) return el;
+    }
+
+    var closest = target.closest && target.closest('button, a, summary, label, [role="button"], [role="tab"], [role="link"], [role="menuitem"], [role="option"], yt-chip-cloud-chip-renderer, ytd-guide-entry-renderer');
+    if (closest && getAccessibleText(closest)) return closest;
+
+    return fallback || target;
+  }
+
+  function normalizeRegionText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function getTextFromRegion(region) {
+    var left = region.left;
+    var top = region.top;
+    var right = left + region.width;
+    var bottom = top + region.height;
+    var chunks = [];
+    var seen = new Set();
+    if (!document.body) return '';
+
+    function rectIntersects(rect) {
+      var pageLeft = rect.left + window.scrollX;
+      var pageTop = rect.top + window.scrollY;
+      var pageRight = pageLeft + rect.width;
+      var pageBottom = pageTop + rect.height;
+      return !(pageRight < left || pageLeft > right || pageBottom < top || pageTop > bottom);
+    }
+
+    function addText(text) {
+      text = normalizeRegionText(text);
+      if (!text || seen.has(text)) return;
+      seen.add(text);
+      chunks.push(text);
+    }
+
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+      acceptNode: function(node) {
+        if (!normalizeRegionText(node.nodeValue)) return NodeFilter.FILTER_REJECT;
+        var parent = node.parentElement;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        var style = window.getComputedStyle(parent);
+        if (!style || style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    while (walker.nextNode()) {
+      var range = document.createRange();
+      range.selectNodeContents(walker.currentNode);
+      var rects = range.getClientRects();
+      for (var i = 0; i < rects.length; i++) {
+        if (rectIntersects(rects[i])) {
+          addText(walker.currentNode.nodeValue);
+          break;
+        }
+      }
+      range.detach();
+    }
+
+    var fields = document.body.querySelectorAll('input, textarea, select');
+    Array.prototype.forEach.call(fields, function(el) {
+      if (!el || (assertionSelectState && (el === assertionSelectState.overlay || el === assertionSelectState.box || el === assertionSelectState.hint))) return;
+      var style = window.getComputedStyle(el);
+      if (!style || style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return;
+      var rect = el.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0 || !rectIntersects(rect)) return;
+      addText(el.value || el.placeholder || '');
+    });
+
+    return normalizeRegionText(chunks.join(' '));
+  }
+
+  function getPrimaryElementInRegion(region) {
+    var x = Math.max(0, Math.min(window.innerWidth - 1, region.left - window.scrollX + region.width / 2));
+    var y = Math.max(0, Math.min(window.innerHeight - 1, region.top - window.scrollY + region.height / 2));
+    var el = document.elementFromPoint(x, y);
+    if (!el) return null;
+    if (assertionSelectState && (el === assertionSelectState.overlay || el === assertionSelectState.box || el === assertionSelectState.hint)) {
+      var oldDisplay = assertionSelectState.overlay.style.display;
+      assertionSelectState.overlay.style.display = 'none';
+      el = document.elementFromPoint(x, y);
+      assertionSelectState.overlay.style.display = oldDisplay;
+    }
+    return el;
+  }
+
+  function finishAssertionRegionSelect(region) {
+    var primary = getPrimaryElementInRegion(region);
+    var result = {
+      region: region,
+      text: getTextFromRegion(region),
+      selector: getElementSelector(primary),
+      target: primary ? {
+        tagName: primary.tagName || '',
+        id: primary.id || '',
+        className: (primary.className && typeof primary.className === 'string') ? primary.className : '',
+        textContent: getElementText(primary),
+        selector: getElementSelector(primary)
+      } : null,
+      pageUrl: window.location.href,
+      pageTitle: document.title
+    };
+    cleanupAssertionRegionSelect();
+    return result;
+  }
+
+  function cleanupAssertionRegionSelect() {
+    if (!assertionSelectState) {
+      assertionSelectActive = false;
+      return;
+    }
+    document.removeEventListener('mousedown', assertionSelectState.onMouseDown, true);
+    document.removeEventListener('mousemove', assertionSelectState.onMouseMove, true);
+    document.removeEventListener('mouseup', assertionSelectState.onMouseUp, true);
+    document.removeEventListener('keydown', assertionSelectState.onKeyDown, true);
+    if (assertionSelectState.overlay) assertionSelectState.overlay.remove();
+    assertionSelectState = null;
+    assertionSelectActive = false;
+    assertionSuppressEventsUntil = Date.now() + 500;
+  }
+
+  function startAssertionRegionSelect(options, done) {
+    cleanupAssertionRegionSelect();
+    assertionSelectActive = true;
+
+    var overlay = document.createElement('div');
+    overlay.id = '__assertion_region_overlay__';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:crosshair;background:rgba(15,23,42,0.08);';
+
+    var box = document.createElement('div');
+    box.style.cssText = 'position:fixed;display:none;border:2px solid #f59e0b;background:rgba(245,158,11,0.16);box-shadow:0 0 0 9999px rgba(15,23,42,0.18);pointer-events:none;';
+
+    var hint = document.createElement('div');
+    hint.textContent = '\u62d6\u62fd\u9009\u62e9\u65ad\u8a00\u533a\u57df\uff0c\u6309 Esc \u53d6\u6d88';
+    hint.style.cssText = 'position:fixed;left:16px;top:16px;padding:8px 10px;border-radius:6px;background:#111827;color:#f8fafc;font:12px/1.4 system-ui,-apple-system,Segoe UI,sans-serif;box-shadow:0 6px 24px rgba(15,23,42,0.28);pointer-events:none;';
+
+    overlay.appendChild(box);
+    overlay.appendChild(hint);
+    document.documentElement.appendChild(overlay);
+
+    assertionSelectState = {
+      overlay: overlay,
+      box: box,
+      hint: hint,
+      startX: 0,
+      startY: 0,
+      dragging: false,
+      done: done,
+      onMouseDown: function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        assertionSelectState.dragging = true;
+        assertionSelectState.startX = e.clientX;
+        assertionSelectState.startY = e.clientY;
+        box.style.display = 'block';
+        box.style.left = e.clientX + 'px';
+        box.style.top = e.clientY + 'px';
+        box.style.width = '0px';
+        box.style.height = '0px';
+      },
+      onMouseMove: function(e) {
+        if (!assertionSelectState || !assertionSelectState.dragging) return;
+        e.preventDefault();
+        e.stopPropagation();
+        var left = Math.min(assertionSelectState.startX, e.clientX);
+        var top = Math.min(assertionSelectState.startY, e.clientY);
+        var width = Math.abs(e.clientX - assertionSelectState.startX);
+        var height = Math.abs(e.clientY - assertionSelectState.startY);
+        box.style.left = left + 'px';
+        box.style.top = top + 'px';
+        box.style.width = width + 'px';
+        box.style.height = height + 'px';
+      },
+      onMouseUp: function(e) {
+        if (!assertionSelectState || !assertionSelectState.dragging) return;
+        e.preventDefault();
+        e.stopPropagation();
+        var left = Math.min(assertionSelectState.startX, e.clientX);
+        var top = Math.min(assertionSelectState.startY, e.clientY);
+        var width = Math.abs(e.clientX - assertionSelectState.startX);
+        var height = Math.abs(e.clientY - assertionSelectState.startY);
+        if (width < 8 || height < 8) {
+          cleanupAssertionRegionSelect();
+          done({ success: false, error: 'Selection is too small' });
+          return;
+        }
+        var region = {
+          left: left + window.scrollX,
+          top: top + window.scrollY,
+          width: width,
+          height: height,
+          viewportWidth: document.documentElement.clientWidth,
+          viewportHeight: document.documentElement.clientHeight,
+          windowWidth: window.innerWidth,
+          windowHeight: window.innerHeight,
+          scrollX: window.scrollX,
+          scrollY: window.scrollY
+        };
+        done({ success: true, data: finishAssertionRegionSelect(region) });
+      },
+      onKeyDown: function(e) {
+        if (e.key !== 'Escape') return;
+        e.preventDefault();
+        e.stopPropagation();
+        cleanupAssertionRegionSelect();
+        done({ success: false, error: 'Selection canceled' });
+      }
+    };
+
+    document.addEventListener('mousedown', assertionSelectState.onMouseDown, true);
+    document.addEventListener('mousemove', assertionSelectState.onMouseMove, true);
+    document.addEventListener('mouseup', assertionSelectState.onMouseUp, true);
+    document.addEventListener('keydown', assertionSelectState.onKeyDown, true);
+  }
+
   // 是否可编辑
   function isEditableElement(el) {
     if (!el) return false;
     var tagName = (el.tagName || '').toUpperCase();
     return tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT' || el.isContentEditable;
   }
-  
+
   // 构建操作数据
   function buildActionData(type, event) {
-    var target = event.target;
+    var originalTarget = event.target;
+    var target = getActionTarget(event) || originalTarget;
     var rect = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
-    
+
     return {
       type: type,
       x: event.clientX,
@@ -176,69 +442,82 @@
         textContent: document.title
       }
     };
-    
+
     sendAction(actionData);
-    console.log('记录导航步骤:', window.location.href);
+      console.log('page navigation:', window.location.href);
   }
-  
+
   // 监听点击
   document.addEventListener('click', function(e) {
+    if (assertionSelectActive || Date.now() < assertionSuppressEventsUntil) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (!isRecording) return;
-    
+
     var target = e.target;
     var tagName = (target.tagName || '').toUpperCase();
-    
+
     if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT') {
       sendAction(buildActionData('focus', e));
       return;
     }
-    
+
     sendAction(buildActionData('click', e));
   }, true);
-  
+
   // 监听右键
   document.addEventListener('contextmenu', function(e) {
+    if (assertionSelectActive || Date.now() < assertionSuppressEventsUntil) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (!isRecording) return;
     sendAction(buildActionData('rightClick', e));
   });
-  
+
   // 监听双击
   document.addEventListener('dblclick', function(e) {
+    if (assertionSelectActive || Date.now() < assertionSuppressEventsUntil) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (!isRecording) return;
     sendAction(buildActionData('dblclick', e));
   });
 
-  // 存储每个输入框的最终值（用于聚合）
-var pendingInputValues = new Map();
-var pendingInputTimers = new Map();
-  
+  // Track final values for input aggregation.
+  var pendingInputValues = new Map();
+  var pendingInputTimers = new Map();
+
   // 监听输入
   document.addEventListener('input', function(e) {
   if (!isRecording) return;
-  
+
   var target = e.target;
   if (!isEditableElement(target)) return;
-  
+
   // 生成输入框的唯一标识
   var inputKey = getElementSelector(target) || target.name || target.id || 'unknown';
-  
-  // 获取当前值
+
+  // Get current value.
   var currentValue = target.value || target.textContent || '';
-  
-  // 存储最终值
+
+  // Store final value.
   pendingInputValues.set(inputKey, currentValue);
-  
+
   // 清除之前的定时器
   if (pendingInputTimers.has(inputKey)) {
     clearTimeout(pendingInputTimers.get(inputKey));
   }
-  
-  // ✅ 设置新的定时器，用户停止输入 500ms 后保存最终值
+  // save final value after input settles
   var timer = setTimeout(function() {
     var finalValue = pendingInputValues.get(inputKey);
     if (finalValue !== undefined) {
-      var previousValue = ''; // 可以从之前的记录获取，这里简化
-      
+      var previousValue = ''; // 可以从之前的记录获取，这里简�?
       var actionData = {
         type: 'input',
         value: finalValue,
@@ -258,27 +537,27 @@ var pendingInputTimers = new Map();
           selector: getElementSelector(target)
         }
       };
-      
+
       sendAction(actionData);
-      console.log('保存最终输入值:', finalValue);
-      
+      console.log('inject replay script failed:', e);
+
       // 清理
       pendingInputValues.delete(inputKey);
       pendingInputTimers.delete(inputKey);
     }
   }, 500); // 500ms 无输入后保存
-  
+
   pendingInputTimers.set(inputKey, timer);
 }, true);
-  
+
   // 监听键盘
   document.addEventListener('keydown', function(e) {
     if (!isRecording) return;
-    
+
     var target = e.target;
     var specialKeys = ['Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
     if (specialKeys.indexOf(e.key) === -1) return;
-    
+
     if (isEditableElement(target)) {
       var actionData = {
         type: 'keydown',
@@ -300,15 +579,15 @@ var pendingInputTimers = new Map();
           selector: getElementSelector(target)
         }
       };
-      
+
       sendAction(actionData);
     }
   }, true);
-  
+
   // 监听submit
   document.addEventListener('submit', function(e) {
     if (!isRecording) return;
-    
+
     var target = e.target;
     var actionData = {
       type: 'submit',
@@ -324,28 +603,37 @@ var pendingInputTimers = new Map();
         selector: getElementSelector(target)
       }
     };
-    
+
     sendAction(actionData);
   }, true);
-  
+
   // 监听滚动
+  window.addEventListener('wheel', markUserScrollIntent, { passive: true, capture: true });
+  window.addEventListener('touchmove', markUserScrollIntent, { passive: true, capture: true });
+  document.addEventListener('keydown', function(e) {
+    var scrollKeys = ['PageDown', 'PageUp', 'Home', 'End', 'ArrowDown', 'ArrowUp', 'Space'];
+    if (scrollKeys.indexOf(e.code || e.key) !== -1 || scrollKeys.indexOf(e.key) !== -1) markUserScrollIntent();
+  }, true);
+
   window.addEventListener('scroll', function() {
     if (!isRecording) return;
-    
+    if (assertionSelectActive || Date.now() < assertionSuppressEventsUntil) return;
+    if (Date.now() > userScrollUntil) return;
+
     if (scrollTimer) clearTimeout(scrollTimer);
     scrollTimer = setTimeout(function() {
       sendScrollPosition();
       scrollTimer = null;
     }, 300);
   }, { passive: true });
-  
+
   // 监听窗口大小变化
   window.addEventListener('resize', function() {
     var now = Date.now();
     if (now - lastResizeTime > 500) {
       lastResizeTime = now;
       var updatedInfo = updateAndNotifyWindowInfo();
-      
+
       if (isRecording) {
         sendAction(Object.assign({}, updatedInfo, {
           type: 'resize',
@@ -354,10 +642,9 @@ var pendingInputTimers = new Map();
       }
     }
   });
-  
-  // 页面卸载前
+  // before unload
   window.addEventListener('beforeunload', function() {
-  // ✅ 在页面跳转前，保存所有未完成的输入
+  // flush pending input values
   pendingInputValues.forEach(function(finalValue, key) {
     if (finalValue !== undefined) {
       var history = { lastValue: finalValue };
@@ -376,15 +663,15 @@ var pendingInputTimers = new Map();
         }
       };
       sendAction(actionData);
-      console.log('页面跳转前保存输入:', history.lastValue);
+      console.log('inject replay script failed:', e);
     }
   });
-  
-  if (isRecording && scrollTimer) {
+
+  if (isRecording && scrollTimer && Date.now() <= userScrollUntil) {
     clearTimeout(scrollTimer);
     sendScrollPosition();
   }
-  
+
   // 清理所有定时器
   pendingInputTimers.forEach(function(timer) {
     clearTimeout(timer);
@@ -393,7 +680,7 @@ var pendingInputTimers = new Map();
   pendingInputTimers.clear();
   inputValueTracker.clear();
 });
-  
+
   // 响应消息
   chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
     if (request.action === 'getCurrentInfo') {
@@ -401,19 +688,27 @@ var pendingInputTimers = new Map();
       sendResponse({ windowInfo: windowInfo, isRecording: isRecording });
       return false;
     }
-    
+
     if (request.action === 'updateRecordingStatus') {
       var wasRecording = isRecording;
       isRecording = request.isRecording;
-      
+
       if (!wasRecording && isRecording && !request.suppressInitialNavigation) recordNavigationStep();
       if (!isRecording) inputValueTracker.clear();
-      
-      console.log('录制状态:', isRecording ? '录制中' : '已停止');
+      console.log('recording status:', isRecording ? 'recording' : 'stopped');
       sendResponse({ success: true });
       return false;
     }
-    
+
+    if (request.action === 'startAssertionRegionSelect') {
+      startAssertionRegionSelect(request.options || {}, function(result) {
+        try {
+          sendResponse(result);
+        } catch (e) {}
+      });
+      return true;
+    }
+
     if (request.action === 'startReplayScript' || request.action === 'stopReplayScript' ||
         request.action === 'pauseReplayScript' || request.action === 'resumeReplayScript') {
       window.postMessage({
@@ -426,15 +721,14 @@ var pendingInputTimers = new Map();
       sendResponse({ success: true });
       return false;
     }
-    
+
     sendResponse({ success: false, error: 'Unknown action' });
     return false;
   });
-  
-  // 转发回放状态
+  // forward replay status
   window.addEventListener('message', function(event) {
     if (event.source !== window) return;
-    
+
     if (event.data && (event.data.type === 'REPLAY_STEP_RESULT' || event.data.type === 'REPLAY_STATUS')) {
       chrome.runtime.sendMessage({
         type: event.data.type === 'REPLAY_STEP_RESULT' ? 'replayStepResult' : 'replayStatus',
@@ -443,22 +737,20 @@ var pendingInputTimers = new Map();
     }
   });
 
-// ✅ 检查是否需要恢复录制状态（页面跳转后）
+// �?检查是否需要恢复录制状态（页面跳转后）
 (function checkRecordingResume() {
-  // 从 sessionStorage 读取录制状态
+  // read recording state from sessionStorage
   var savedState = sessionStorage.getItem('__recording_state__');
   if (savedState) {
     var state = JSON.parse(savedState);
-    console.log('检测到待恢复的录制状态:', state);
-    
-    // 清除保存的状态（避免重复恢复）
+      console.log('inject replay script failed:', e);
+    // clear saved state
     sessionStorage.removeItem('__recording_state__');
-    
-    // 延迟恢复，确保页面加载完成
+    // resume after page load
     setTimeout(function() {
       isRecording = true;
-      console.log('已恢复录制状态，当前页面:', window.location.href);
-      
+      console.log('page navigation:', window.location.href);
+
       // 记录导航步骤（从旧页面跳转到新页面）
       var actionData = {
         type: 'navigation',
@@ -476,14 +768,14 @@ var pendingInputTimers = new Map();
           textContent: document.title
         }
       };
-      
+
       sendAction(actionData);
-      console.log('记录跳转后的页面:', window.location.href);
+      console.log('page navigation:', window.location.href);
     }, 1000);
   }
 })();
 
-// 在页面即将跳转时保存录制状态
+// save recording state before navigation
 window.addEventListener('beforeunload', function() {
   if (isRecording) {
     // 保存录制状态到 sessionStorage
@@ -492,19 +784,18 @@ window.addEventListener('beforeunload', function() {
       timestamp: new Date().toISOString(),
       previousUrl: window.location.href
     }));
-    console.log('页面即将跳转，已保存录制状态');
+    console.log('recording state saved before navigation');
   }
-  
+
   if (scrollTimer) {
     clearTimeout(scrollTimer);
     sendScrollPosition();
   }
   inputValueTracker.clear();
 });
-  
-  // 初始化
+  // init
   updateAndNotifyWindowInfo();
-  console.log('Content Script 初始化完成');
+  console.log('Content Script initialized');
 })();
 
 // 检查是否有待回放的回放步骤
@@ -513,19 +804,19 @@ window.addEventListener('beforeunload', function() {
   var pendingData = response && response.data;
   if (pendingData) {
     console.log('检测到待回放步骤，请求 background 注入回放脚本');
-    
-    // 通过 background 注入，确保 chrome.runtime 可用
-    chrome.runtime.sendMessage({ 
+
+    // 通过 background 注入，确�?chrome.runtime 可用
+    chrome.runtime.sendMessage({
       type: 'injectReplayScript'
     }).catch(function(e) {
-      console.log('发送注入请求失败:', e);
+      console.log('inject replay script failed:', e);
     });
-    
-    // 添加重试机制：如果3秒后还没有回放脚本，再次请求
+
+    // 添加重试机制：如�?秒后还没有回放脚本，再次请求
     setTimeout(function() {
       if (!window.__replayer && !window.__replay_injected) {
-        console.log('重试：再次请求注入回放脚本');
-        chrome.runtime.sendMessage({ 
+        console.log('retry inject replay script');
+        chrome.runtime.sendMessage({
           type: 'injectReplayScript'
         }).catch(function(e) {});
       }
