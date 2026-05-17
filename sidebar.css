@@ -10,6 +10,8 @@ html, body {
   overflow: hidden;
 }
 
+.hidden { display: none !important; }
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   background: #0f172a;
@@ -102,6 +104,12 @@ body {
   color: white;
 }
 .btn-import:hover { background: linear-gradient(135deg, #7c3aed, #6d28d9); }
+
+.btn-wait {
+  background: linear-gradient(135deg, #14b8a6, #0d9488);
+  color: white;
+}
+.btn-wait:hover { background: linear-gradient(135deg, #0d9488, #0f766e); }
 
 .btn-cancel {
   background: rgba(100, 116, 139, 0.2);
@@ -336,6 +344,7 @@ body {
 .action-card.input { border-left: 3px solid #8b5cf6; }
 .action-card.keydown { border-left: 3px solid #f59e0b; }
 .action-card.submit { border-left: 3px solid #10b981; }
+.action-card.wait { border-left: 3px solid #14b8a6; }
 .action-card.navigation {
   border-left: 3px solid #06b6d4;
   background: rgba(6, 182, 212, 0.05);
@@ -350,6 +359,7 @@ body {
 .action-card.input .action-icon { background: rgba(139, 92, 246, 0.2); }
 .action-card.keydown .action-icon { background: rgba(245, 158, 11, 0.2); }
 .action-card.submit .action-icon { background: rgba(16, 185, 129, 0.2); }
+.action-card.wait .action-icon { background: rgba(20, 184, 166, 0.2); }
 .action-card.navigation .action-icon { background: rgba(6, 182, 212, 0.2); }
 
 .card-header {

@@ -23,6 +23,8 @@ var editingStepIndex = -1;
 var editInfoStepIndex = -1;
 var editingAssertionIndex = -1;
 var editingAssertionSource = 'record';
+var editingWaitIndex = -1;
+var editingWaitSource = 'record';
 var _lastReceivedMessage = {};
 var _lastMessageTime = {};
 
@@ -40,7 +42,8 @@ var assertionTypeMap = {
 var typeMap = {
   click: '鼠标点击', rightClick: '右键点击', dblclick: '双击',
   scroll: '页面滚动', resize: '窗口调整', focus: '聚焦输入框',
-  input: '输入内容', keydown: '按键操作', submit: '提交表单', navigation: '打开页面'
+  input: '输入内容', keydown: '按键操作', submit: '提交表单', navigation: '打开页面',
+  wait: '等待'
 };
 
 // DOM元素
@@ -473,6 +476,197 @@ function closeAssertionDialog() {
   editingAssertionSource = 'record';
 }
 
+function normalizeWaitMode(mode) {
+  return mode === 'element' ? 'element' : 'time';
+}
+
+function getWaitDuration(step) {
+  var value = step && step.waitMs != null ? step.waitMs : 1000;
+  value = Number(value);
+  if (isNaN(value) || value < 0) value = 1000;
+  return Math.round(value);
+}
+
+function getWaitTimeout(step) {
+  var value = step && step.waitTimeoutMs != null ? step.waitTimeoutMs : 10000;
+  value = Number(value);
+  if (isNaN(value) || value < 0) value = 10000;
+  return Math.round(value);
+}
+
+function createWaitStep() {
+  return {
+    type: 'wait',
+    stepName: '等待',
+    waitMode: 'time',
+    waitMs: 1000,
+    waitSelector: '',
+    waitTimeoutMs: 10000,
+    timestamp: new Date().toISOString(),
+    pageUrl: currentPageUrl || '',
+    pageTitle: currentPageTitle || '',
+    target: { tagName: 'PAGE' },
+    assertions: []
+  };
+}
+
+function ensureWaitDialog() {
+  var dialog = document.getElementById('waitStepDialog');
+  if (dialog) return dialog;
+
+  dialog = document.createElement('div');
+  dialog.id = 'waitStepDialog';
+  dialog.className = 'dialog-overlay hidden';
+  dialog.innerHTML =
+    '<div class="dialog wait-dialog">' +
+      '<div class="dialog-header">' +
+        '<h3>等待设置</h3>' +
+        '<button id="closeWaitDialogBtn" class="dialog-close">&times;</button>' +
+      '</div>' +
+      '<div class="dialog-body">' +
+        '<div class="form-group">' +
+          '<label for="waitStepName">步骤名称</label>' +
+          '<input type="text" id="waitStepName" class="form-input" placeholder="等待">' +
+        '</div>' +
+        '<div class="form-group">' +
+          '<label for="waitMode">等待方式</label>' +
+          '<select id="waitMode" class="form-input">' +
+            '<option value="time">等待固定时间</option>' +
+            '<option value="element">等待元素出现</option>' +
+          '</select>' +
+        '</div>' +
+        '<div class="form-group" id="waitTimeGroup">' +
+          '<label for="waitMs">等待时间 (ms)</label>' +
+          '<input type="number" id="waitMs" class="form-input" min="0" step="100" value="1000">' +
+        '</div>' +
+        '<div class="form-group hidden" id="waitElementGroup">' +
+          '<label for="waitSelector">CSS selector</label>' +
+          '<input type="text" id="waitSelector" class="form-input" placeholder="#submit, .loaded, [data-ready=true]">' +
+          '<span class="form-hint">找到该元素后继续执行下一步。</span>' +
+        '</div>' +
+        '<div class="form-group hidden" id="waitTimeoutGroup">' +
+          '<label for="waitTimeoutMs">最长等待时间 (ms)</label>' +
+          '<input type="number" id="waitTimeoutMs" class="form-input" min="0" step="500" value="10000">' +
+        '</div>' +
+      '</div>' +
+      '<div class="dialog-footer">' +
+        '<button id="cancelWaitBtn" class="btn btn-cancel">取消</button>' +
+        '<button id="confirmWaitBtn" class="btn btn-confirm">保存</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(dialog);
+
+  document.getElementById('closeWaitDialogBtn').addEventListener('click', closeWaitDialog);
+  document.getElementById('cancelWaitBtn').addEventListener('click', closeWaitDialog);
+  document.getElementById('confirmWaitBtn').addEventListener('click', saveWaitStep);
+  document.getElementById('waitMode').addEventListener('change', updateWaitModeFields);
+  dialog.addEventListener('click', function(e) { if (e.target === dialog) closeWaitDialog(); });
+  return dialog;
+}
+
+function updateWaitModeFields() {
+  var modeEl = document.getElementById('waitMode');
+  var mode = normalizeWaitMode(modeEl ? modeEl.value : 'time');
+  var isElement = mode === 'element';
+  var waitTimeGroup = document.getElementById('waitTimeGroup');
+  var waitElementGroup = document.getElementById('waitElementGroup');
+  var waitTimeoutGroup = document.getElementById('waitTimeoutGroup');
+  if (waitTimeGroup) waitTimeGroup.classList.toggle('hidden', isElement);
+  if (waitElementGroup) waitElementGroup.classList.toggle('hidden', !isElement);
+  if (waitTimeoutGroup) waitTimeoutGroup.classList.toggle('hidden', !isElement);
+}
+
+function openWaitDialog(index, source) {
+  editingWaitSource = source === 'replay' ? 'replay' : 'record';
+  editingWaitIndex = typeof index === 'number' ? index : -1;
+  var steps = getEditableSteps(editingWaitSource);
+  var step = editingWaitIndex >= 0 ? steps[editingWaitIndex] : createWaitStep();
+  var dialog = ensureWaitDialog();
+
+  document.getElementById('waitStepName').value = step.stepName || '';
+  document.getElementById('waitMode').value = normalizeWaitMode(step.waitMode);
+  document.getElementById('waitMs').value = String(getWaitDuration(step));
+  document.getElementById('waitSelector').value = step.waitSelector || '';
+  document.getElementById('waitTimeoutMs').value = String(getWaitTimeout(step));
+  updateWaitModeFields();
+
+  dialog.classList.remove('hidden');
+  var focusEl = normalizeWaitMode(step.waitMode) === 'element' ? document.getElementById('waitSelector') : document.getElementById('waitMs');
+  if (focusEl) focusEl.focus();
+}
+
+function closeWaitDialog() {
+  var dialog = document.getElementById('waitStepDialog');
+  if (dialog) dialog.classList.add('hidden');
+  editingWaitIndex = -1;
+  editingWaitSource = 'record';
+}
+
+function collectWaitStepFromDialog(existing) {
+  var mode = normalizeWaitMode(document.getElementById('waitMode').value);
+  var step = Object.assign({}, existing || createWaitStep(), {
+    type: 'wait',
+    stepName: document.getElementById('waitStepName').value.trim() || null,
+    waitMode: mode,
+    waitMs: Math.max(0, Number(document.getElementById('waitMs').value) || 0),
+    waitSelector: document.getElementById('waitSelector').value.trim(),
+    waitTimeoutMs: Math.max(0, Number(document.getElementById('waitTimeoutMs').value) || 0),
+    target: Object.assign({ tagName: 'PAGE' }, existing && existing.target ? existing.target : {})
+  });
+  if (mode === 'time') step.waitSelector = '';
+  return step;
+}
+
+async function persistEditableSteps(source) {
+  if (source === 'replay') {
+    replaySteps = normalizeReplaySteps(replaySteps);
+    continuationSteps = cloneStepsForRecording(replaySteps);
+    if (continuationSessionId) {
+      chrome.runtime.sendMessage({ type: 'updateSessionSteps', sessionId: continuationSessionId, steps: cloneStepsForRecording(replaySteps) }).catch(function() {});
+    }
+    renderReplayList();
+    return;
+  }
+
+  actionHistory.forEach(function(action, i) { action.stepNumber = actionHistory.length - i; });
+  stepCounter = actionHistory.length;
+  updateStepCount();
+  renderActionList(actionHistory);
+  chrome.runtime.sendMessage({ type: 'setActionHistory', steps: actionHistory }).catch(function() {});
+}
+
+function saveWaitStep() {
+  var source = editingWaitSource;
+  var steps = getEditableSteps(source);
+  var existing = editingWaitIndex >= 0 ? steps[editingWaitIndex] : null;
+  var mode = normalizeWaitMode(document.getElementById('waitMode').value);
+  var selectorInput = document.getElementById('waitSelector');
+  var timeoutInput = document.getElementById('waitTimeoutMs');
+
+  selectorInput.classList.remove('form-input-error');
+  timeoutInput.classList.remove('form-input-error');
+
+  if (mode === 'element' && !selectorInput.value.trim()) {
+    selectorInput.classList.add('form-input-error');
+    showToast('请输入要等待的 CSS selector');
+    return;
+  }
+
+  var step = collectWaitStepFromDialog(existing);
+  if (editingWaitIndex >= 0) {
+    steps[editingWaitIndex] = step;
+  } else if (source === 'record') {
+    actionHistory.unshift(step);
+  } else {
+    step.stepNumber = replaySteps.length + 1;
+    replaySteps.push(step);
+  }
+
+  persistEditableSteps(source);
+  closeWaitDialog();
+  showToast('等待步骤已保存');
+}
+
 function getExportSourceSteps() {
   return replaySteps && replaySteps.length ? replaySteps : actionHistory;
 }
@@ -755,7 +949,8 @@ function createActionCard(action, index, isReplayMode) {
   var iconMap = {
     click: '🖱️', rightClick: '🖱️', dblclick: '🖱️',
     scroll: '📜', resize: '📏', focus: '🔍',
-    input: '⌨️', keydown: '⌨️', submit: '📤', navigation: '🌐'
+    input: '⌨️', keydown: '⌨️', submit: '📤', navigation: '🌐',
+    wait: '⏱'
   };
 
   var icon = iconMap[action.type] || '📌';
@@ -806,6 +1001,13 @@ function createActionCard(action, index, isReplayMode) {
     var displayUrl = (action.url || '').length > 50 ? (action.url || '').substring(0, 50) + '...' : (action.url || '');
     var displayTitle = (action.title || '').length > 30 ? (action.title || '').substring(0, 30) + '...' : (action.title || '');
     coordinatesHTML = '<div class="card-body navigation-display"><div class="card-info-item input-value-full"><div class="card-info-label">页面标题</div><div class="card-info-value">' + escapeHTML(displayTitle) + '</div></div><div class="card-info-item input-value-full"><div class="card-info-label">页面URL</div><div class="card-info-value coordinate url-text-display" title="' + escapeHTML(action.url || '') + '">' + escapeHTML(displayUrl) + '</div></div></div>';
+  } else if (action.type === 'wait') {
+    var waitMode = normalizeWaitMode(action.waitMode);
+    if (waitMode === 'element') {
+      coordinatesHTML = '<div class="card-body wait-display"><div class="card-info-item input-value-full"><div class="card-info-label">等待元素</div><div class="card-info-value coordinate" title="' + escapeHTML(action.waitSelector || '') + '">' + escapeHTML(action.waitSelector || '-') + '</div></div><div class="card-info-item input-value-full"><div class="card-info-label">最长等待</div><div class="card-info-value coordinate">' + getWaitTimeout(action) + 'ms</div></div></div>';
+    } else {
+      coordinatesHTML = '<div class="card-body wait-display"><div class="card-info-item input-value-full"><div class="card-info-label">等待时间</div><div class="card-info-value coordinate">' + getWaitDuration(action) + 'ms</div></div></div>';
+    }
   } else {
     coordinatesHTML = '<div class="card-body"><div class="card-info-item"><div class="card-info-label">Client X</div><div class="card-info-value coordinate">' + (action.x != null ? action.x + 'px' : '-') + '</div></div><div class="card-info-item"><div class="card-info-label">Client Y</div><div class="card-info-value coordinate">' + (action.y != null ? action.y + 'px' : '-') + '</div></div>' + (action.pageX != null ? '<div class="card-info-item"><div class="card-info-label">Page X</div><div class="card-info-value">' + action.pageX + 'px</div></div>' : '') + (action.pageY != null ? '<div class="card-info-item"><div class="card-info-label">Page Y</div><div class="card-info-value">' + action.pageY + 'px</div></div>' : '') + '</div>';
   }
@@ -847,7 +1049,9 @@ function createActionCard(action, index, isReplayMode) {
   var assertionHTML = getAssertionSummary(action, isReplayMode);
   var actionButtons = '';
   if (isReplayMode) {
-    actionButtons = '<div class="card-actions always-visible"><button class="btn-card-action btn-card-assert" data-index="' + index + '" title="编辑断言">断</button></div>';
+    actionButtons = '<div class="card-actions always-visible">' +
+      (action.type === 'wait' ? '<button class="btn-card-action btn-card-wait" data-index="' + index + '" title="编辑等待">⏱</button>' : '') +
+      '<button class="btn-card-action btn-card-assert" data-index="' + index + '" title="编辑断言">断</button></div>';
   } else {
     actionButtons = '<div class="card-actions"><button class="btn-card-action btn-card-edit" data-index="' + index + '" title="修改信息">✏️</button><button class="btn-card-action btn-card-delete" data-index="' + index + '" title="删除步骤">🗑️</button></div>';
   }
@@ -875,12 +1079,23 @@ function createActionCard(action, index, isReplayMode) {
     })(index));
   }
 
+  var waitBtn = card.querySelector('.btn-card-wait');
+  if (waitBtn) {
+    waitBtn.addEventListener('click', (function(idx) {
+      return function(e) { e.stopPropagation(); openWaitDialog(idx, isReplayMode ? 'replay' : 'record'); };
+    })(index));
+  }
+
   // 绑定事件
   if (!isReplayMode) {
     var editBtn = card.querySelector('.btn-card-edit');
     if (editBtn) {
       editBtn.addEventListener('click', (function(idx) {
-        return function(e) { e.stopPropagation(); openEditStepDialog(idx); };
+        return function(e) {
+          e.stopPropagation();
+          if (actionHistory[idx] && actionHistory[idx].type === 'wait') openWaitDialog(idx, 'record');
+          else openEditStepDialog(idx);
+        };
       })(index));
     }
 
@@ -1887,6 +2102,20 @@ function clearReplayStorage() {
   });
 }
 
+function ensureAddWaitButton() {
+  var existing = document.getElementById('addWaitStepBtn');
+  if (existing) return existing;
+  var footer = document.querySelector('.sidebar-footer');
+  if (!footer) return null;
+  var button = document.createElement('button');
+  button.id = 'addWaitStepBtn';
+  button.className = 'btn btn-wait';
+  button.type = 'button';
+  button.innerHTML = '<span>⏱</span> 等待';
+  footer.insertBefore(button, footer.firstChild);
+  return button;
+}
+
 // ✅ 新增：检查回放是否完成
 function checkReplayCompletion() {
   // 检查是否还有待回放的步骤
@@ -1921,6 +2150,7 @@ function bindReplayEvents() {
   var replayPlayBtn = document.getElementById('replayPlayBtn');
   var replayPauseBtn = document.getElementById('replayPauseBtn');
   var replayStopBtn = document.getElementById('replayStopBtn');
+  var addWaitStepBtn = ensureAddWaitButton();
 
   // ✅ 清空日志按钮
   var clearLogBtn = document.getElementById('clearLogBtn');
@@ -1932,6 +2162,9 @@ function bindReplayEvents() {
   }
 
   if (importBtn) importBtn.addEventListener('click', importFile);
+  if (addWaitStepBtn) addWaitStepBtn.addEventListener('click', function() {
+    openWaitDialog(-1, replaySteps && replaySteps.length ? 'replay' : 'record');
+  });
   if (fileInput) fileInput.addEventListener('change', handleFileSelect);
   if (closeReplayBtn) closeReplayBtn.addEventListener('click', closeReplayPanel);
 

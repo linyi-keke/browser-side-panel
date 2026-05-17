@@ -106,6 +106,71 @@
     return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
   };
 
+  ActionReplayer.prototype.isDisabled = function(el) {
+    if (!el) return false;
+    return !!el.disabled || el.getAttribute('disabled') !== null || el.getAttribute('aria-disabled') === 'true';
+  };
+
+  ActionReplayer.prototype.setNativeValue = function(element, value) {
+    var tag = (element.tagName || '').toUpperCase();
+    var proto = tag === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (descriptor && descriptor.set) descriptor.set.call(element, value);
+    else element.value = value;
+  };
+
+  ActionReplayer.prototype.dispatchTextInputEvents = function(element, value) {
+    try {
+      element.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        inputType: 'insertText',
+        data: value
+      }));
+    } catch (e) {}
+    try {
+      element.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        inputType: 'insertText',
+        data: value
+      }));
+    } catch (e2) {
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+
+  ActionReplayer.prototype.setContentEditableText = async function(element, value) {
+    element.focus();
+    var selection = window.getSelection();
+    var range = document.createRange();
+    range.selectNodeContents(element);
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    var inserted = false;
+    try {
+      inserted = document.execCommand('insertText', false, value);
+    } catch (e) {
+      inserted = false;
+    }
+
+    if (!inserted || this.normalizeText(element.textContent) !== this.normalizeText(value)) {
+      range.selectNodeContents(element);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      selection.deleteFromDocument();
+      element.textContent = value;
+      range.selectNodeContents(element);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+
+    this.dispatchTextInputEvents(element, value);
+    await new Promise(function(r) { setTimeout(r, 100); });
+  };
+
   ActionReplayer.prototype.normalizeText = function(text) {
     return String(text || '').replace(/\s+/g, ' ').trim();
   };
@@ -188,6 +253,17 @@
     return this.findElement(step);
   };
 
+  ActionReplayer.prototype.waitForActionableElement = async function(step, timeoutMs) {
+    var start = Date.now();
+    var element = null;
+    while (Date.now() - start < timeoutMs) {
+      element = this.findElement(step);
+      if (element && !this.isDisabled(element)) return element;
+      await new Promise(function(r) { setTimeout(r, 200); });
+    }
+    return element || this.findElement(step);
+  };
+
   ActionReplayer.prototype.findBySelector = function(selector) {
     if (!selector) return null;
     try {
@@ -195,6 +271,37 @@
     } catch (e) {
       return null;
     }
+  };
+
+  ActionReplayer.prototype.executeWait = async function(step) {
+    var mode = step && step.waitMode === 'element' ? 'element' : 'time';
+    if (mode === 'element') {
+      var selector = step.waitSelector || '';
+      var timeoutMs = Math.max(0, Number(step.waitTimeoutMs) || 0);
+      if (!selector) {
+        this.log('Wait failed: missing selector', 'fail', step);
+        return false;
+      }
+      this.log('Wait for element: ' + selector + ', timeout=' + timeoutMs + 'ms', 'executing', step);
+      var start = Date.now();
+      while (Date.now() - start <= timeoutMs) {
+        var element = this.findBySelector(selector);
+        if (element) {
+          this.log('Wait element found: ' + describeElement(element), 'success', step);
+          return true;
+        }
+        if (timeoutMs === 0) break;
+        await new Promise(function(r) { setTimeout(r, 200); });
+      }
+      this.log('Wait timed out: element not found: ' + selector, 'fail', step);
+      return false;
+    }
+
+    var waitMs = Math.max(0, Number(step.waitMs) || 0);
+    this.log('Wait fixed time: ' + waitMs + 'ms', 'executing', step);
+    await new Promise(function(r) { setTimeout(r, waitMs); });
+    this.log('Wait finished: ' + waitMs + 'ms', 'success', step);
+    return true;
   };
 
   ActionReplayer.prototype.getElementText = function(element) {
@@ -501,8 +608,13 @@
       var value = step.value || '';
       this.log('准备输入: "' + String(value).substring(0, 80) + '" 到 ' + describeElement(element), 'executing', step);
       if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
-        element.value = '';
+        this.setNativeValue(element, '');
         element.dispatchEvent(new Event('input', { bubbles: true }));
+        this.setNativeValue(element, value);
+        this.dispatchTextInputEvents(element, value);
+      } else if (element.isContentEditable) {
+        await this.setContentEditableText(element, value);
+      } else if (element.tagName === 'SELECT') {
         element.value = value;
         element.dispatchEvent(new Event('input', { bubbles: true }));
         element.dispatchEvent(new Event('change', { bubbles: true }));
@@ -562,7 +674,7 @@
 
   ActionReplayer.prototype.executeClick = async function(step) {
     await this.waitForStepPage(step, 8000);
-    var element = await this.waitForElement(step, 8000);
+    var element = await this.waitForActionableElement(step, 8000);
     if (!element && step.x !== undefined) {
       var expectedPoint = this.getExpectedPoint(step);
       element = document.elementFromPoint(expectedPoint ? expectedPoint.x : step.x, expectedPoint ? expectedPoint.y : step.y);
@@ -579,6 +691,10 @@
     if (!element) {
       this.log('Click failed: element not found', 'fail', step);
       console.warn('点击失败：找不到元素');
+      return false;
+    }
+    if (this.isDisabled(element)) {
+      this.log('Click failed: element is disabled ' + describeElement(element), 'fail', step);
       return false;
     }
     try {
@@ -697,6 +813,7 @@
             case 'input': success = await self.executeInput(step); break;
             case 'keydown': success = await self.executeKeydown(step); break;
             case 'scroll': success = await self.executeScroll(step); break;
+            case 'wait': success = await self.executeWait(step); break;
             case 'rightClick': success = await self.executeMouseEvent(step); break;
             case 'dblclick': success = await self.executeMouseEvent(step); break;
             case 'submit': success = await self.executeSubmit(step); break;

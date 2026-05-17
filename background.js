@@ -516,6 +516,17 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
           sendResponse({ success: true });
           break;
 
+        case 'setActionHistory':
+          var sahHistory = request.steps || [];
+          await chrome.storage.local.set({ actionHistory: sahHistory });
+          if (currentSessionId && recordingSessions[currentSessionId]) {
+            recordingSessions[currentSessionId].actions = cloneInitialActions([].concat(sahHistory).reverse());
+            await saveSessionToStorage(currentSessionId);
+            await chrome.storage.local.set({ sessions: recordingSessions });
+          }
+          sendResponse({ success: true });
+          break;
+
         case 'updateStepName':
           var snData = await chrome.storage.local.get(['actionHistory']);
           var snHistory = snData.actionHistory || [];
