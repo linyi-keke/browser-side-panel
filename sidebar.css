@@ -111,6 +111,12 @@ body {
 }
 .btn-wait:hover { background: linear-gradient(135deg, #0d9488, #0f766e); }
 
+.btn-hover {
+  background: linear-gradient(135deg, #6366f1, #4f46e5);
+  color: white;
+}
+.btn-hover:hover { background: linear-gradient(135deg, #4f46e5, #4338ca); }
+
 .btn-cancel {
   background: rgba(100, 116, 139, 0.2);
   color: #94a3b8;
@@ -338,6 +344,7 @@ body {
 .action-card.click,
 .action-card.rightClick,
 .action-card.dblclick { border-left: 3px solid #3b82f6; }
+.action-card.hover { border-left: 3px solid #6366f1; }
 .action-card.scroll { border-left: 3px solid #10b981; }
 .action-card.resize { border-left: 3px solid #8b5cf6; }
 .action-card.focus { border-left: 3px solid #3b82f6; }
@@ -353,6 +360,7 @@ body {
 .action-card.click .action-icon,
 .action-card.rightClick .action-icon,
 .action-card.dblclick .action-icon { background: rgba(59, 130, 246, 0.2); }
+.action-card.hover .action-icon { background: rgba(99, 102, 241, 0.2); }
 .action-card.scroll .action-icon { background: rgba(16, 185, 129, 0.2); }
 .action-card.resize .action-icon { background: rgba(139, 92, 246, 0.2); }
 .action-card.focus .action-icon { background: rgba(59, 130, 246, 0.2); }

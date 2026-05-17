@@ -18,6 +18,8 @@
   var assertionSelectActive = false;
   var assertionSelectState = null;
   var assertionSuppressEventsUntil = 0;
+  var hoverCaptureActive = false;
+  var hoverCaptureState = null;
   var userScrollUntil = 0;
   console.log('Content Script initialized');
   // update window info
@@ -425,6 +427,90 @@
   }
 
   // 记录导航步骤
+  function cleanupHoverCapture() {
+    if (!hoverCaptureState) {
+      hoverCaptureActive = false;
+      return;
+    }
+    document.removeEventListener('mousemove', hoverCaptureState.onMouseMove, true);
+    document.removeEventListener('keydown', hoverCaptureState.onKeyDown, true);
+    if (hoverCaptureState.timer) clearTimeout(hoverCaptureState.timer);
+    if (hoverCaptureState.indicator && hoverCaptureState.indicator.parentNode) {
+      hoverCaptureState.indicator.parentNode.removeChild(hoverCaptureState.indicator);
+    }
+    hoverCaptureState = null;
+    hoverCaptureActive = false;
+    assertionSuppressEventsUntil = Date.now() + 300;
+  }
+
+  function startHoverCapture(options, done) {
+    if (hoverCaptureActive) {
+      done({ success: false, error: 'Hover capture already active' });
+      return;
+    }
+
+    var settleMs = Number(options && options.settleMs) || 3000;
+    hoverCaptureActive = true;
+    var completed = false;
+    var lastEvent = null;
+
+    var indicator = document.createElement('div');
+    indicator.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;background:rgba(15,23,42,.92);color:#e2e8f0;border:1px solid rgba(148,163,184,.35);border-radius:8px;padding:8px 10px;font:12px/1.4 system-ui,-apple-system,Segoe UI,sans-serif;box-shadow:0 10px 24px rgba(15,23,42,.35);pointer-events:none;';
+    indicator.textContent = '移动到目标位置，停留 3 秒记录悬浮；Esc 取消';
+    document.documentElement.appendChild(indicator);
+
+    function finish(result) {
+      if (completed) return;
+      completed = true;
+      cleanupHoverCapture();
+      try { done(result); } catch (e) {}
+    }
+
+    function schedule(event) {
+      lastEvent = {
+        target: event.target,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        pageX: event.pageX,
+        pageY: event.pageY
+      };
+      if (hoverCaptureState.timer) clearTimeout(hoverCaptureState.timer);
+      indicator.textContent = '保持不动 3 秒以记录悬浮位置';
+      hoverCaptureState.timer = setTimeout(function() {
+        if (!lastEvent) return;
+        var pointTarget = document.elementFromPoint(lastEvent.clientX, lastEvent.clientY) || lastEvent.target;
+        var actionData = buildActionData('hover', {
+          target: pointTarget,
+          clientX: lastEvent.clientX,
+          clientY: lastEvent.clientY,
+          pageX: lastEvent.pageX,
+          pageY: lastEvent.pageY,
+          composedPath: function() { return [pointTarget]; }
+        });
+        actionData.hoverMs = settleMs;
+        finish({ success: true, data: actionData });
+      }, settleMs);
+    }
+
+    hoverCaptureState = {
+      timer: null,
+      indicator: indicator,
+      onMouseMove: function(e) {
+        if (!hoverCaptureActive) return;
+        schedule(e);
+      },
+      onKeyDown: function(e) {
+        if (e.key !== 'Escape') return;
+        e.preventDefault();
+        e.stopPropagation();
+        finish({ success: false, error: 'Hover capture canceled' });
+      }
+    };
+
+    document.addEventListener('mousemove', hoverCaptureState.onMouseMove, true);
+    document.addEventListener('keydown', hoverCaptureState.onKeyDown, true);
+  }
+
   function recordNavigationStep() {
     var actionData = {
       type: 'navigation',
@@ -449,7 +535,7 @@
 
   // 监听点击
   document.addEventListener('click', function(e) {
-    if (assertionSelectActive || Date.now() < assertionSuppressEventsUntil) {
+    if (assertionSelectActive || hoverCaptureActive || Date.now() < assertionSuppressEventsUntil) {
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -469,7 +555,7 @@
 
   // 监听右键
   document.addEventListener('contextmenu', function(e) {
-    if (assertionSelectActive || Date.now() < assertionSuppressEventsUntil) {
+    if (assertionSelectActive || hoverCaptureActive || Date.now() < assertionSuppressEventsUntil) {
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -480,7 +566,7 @@
 
   // 监听双击
   document.addEventListener('dblclick', function(e) {
-    if (assertionSelectActive || Date.now() < assertionSuppressEventsUntil) {
+    if (assertionSelectActive || hoverCaptureActive || Date.now() < assertionSuppressEventsUntil) {
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -702,6 +788,15 @@
 
     if (request.action === 'startAssertionRegionSelect') {
       startAssertionRegionSelect(request.options || {}, function(result) {
+        try {
+          sendResponse(result);
+        } catch (e) {}
+      });
+      return true;
+    }
+
+    if (request.action === 'startHoverCapture') {
+      startHoverCapture(request.options || {}, function(result) {
         try {
           sendResponse(result);
         } catch (e) {}

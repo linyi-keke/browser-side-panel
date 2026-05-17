@@ -770,6 +770,35 @@
     }
   };
 
+  ActionReplayer.prototype.executeHover = async function(step) {
+    var element = this.findElement(step);
+    if (!element) {
+      this.log('Hover failed: element not found', 'fail', step);
+      return false;
+    }
+    try {
+      element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      await new Promise(function(r) { setTimeout(r, 200); });
+      var rect = element.getBoundingClientRect();
+      var x = rect.left + rect.width / 2;
+      var y = rect.top + rect.height / 2;
+      if (step.target && step.target.clickOffsetX != null && step.target.clickOffsetY != null) {
+        x = rect.left + Math.max(0, Math.min(rect.width, step.target.clickOffsetX));
+        y = rect.top + Math.max(0, Math.min(rect.height, step.target.clickOffsetY));
+      }
+      var eventOptions = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window };
+      element.dispatchEvent(new MouseEvent('mouseover', eventOptions));
+      element.dispatchEvent(new MouseEvent('mouseenter', Object.assign({}, eventOptions, { bubbles: false })));
+      element.dispatchEvent(new MouseEvent('mousemove', eventOptions));
+      this.createHighlight(x, y, 'rgba(99, 102, 241, 0.8)');
+      this.log('Hover succeeded at (' + Math.round(x) + ', ' + Math.round(y) + ') on ' + describeElement(element), 'success', step);
+      return true;
+    } catch (error) {
+      this.log('Hover exception: ' + error.message, 'fail', step);
+      return false;
+    }
+  };
+
   ActionReplayer.prototype.executeSubmit = async function(step) {
     var element = this.findElement(step);
     if (!element) {
@@ -809,6 +838,7 @@
           switch (step.type) {
             case 'navigation': success = await self.executeNavigation(step); break;
             case 'click': success = await self.executeClick(step); break;
+            case 'hover': success = await self.executeHover(step); break;
             case 'focus': success = await self.executeFocus(step); break;
             case 'input': success = await self.executeInput(step); break;
             case 'keydown': success = await self.executeKeydown(step); break;

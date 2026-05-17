@@ -40,6 +40,7 @@ var assertionTypeMap = {
 };
 
 var typeMap = {
+  hover: '鼠标悬浮',
   click: '鼠标点击', rightClick: '右键点击', dblclick: '双击',
   scroll: '页面滚动', resize: '窗口调整', focus: '聚焦输入框',
   input: '输入内容', keydown: '按键操作', submit: '提交表单', navigation: '打开页面',
@@ -350,7 +351,7 @@ function openEditStepDialog(index) {
 
   // 坐标信息
   var coordGroup = document.getElementById('editInfoCoordGroup');
-  if (['click', 'rightClick', 'dblclick'].indexOf(action.type) !== -1) {
+  if (['click', 'rightClick', 'dblclick', 'hover'].indexOf(action.type) !== -1) {
     coordGroup.style.display = 'block';
     document.getElementById('editInfoCoordX').value = action.x || '';
     document.getElementById('editInfoCoordY').value = action.y || '';
@@ -385,7 +386,7 @@ function saveStepInfo() {
   var action = actionHistory[editInfoStepIndex];
   action.stepName = document.getElementById('editInfoStepName').value.trim() || null;
 
-  if (['click', 'rightClick', 'dblclick'].indexOf(action.type) !== -1) {
+  if (['click', 'rightClick', 'dblclick', 'hover'].indexOf(action.type) !== -1) {
     var x = parseInt(document.getElementById('editInfoCoordX').value);
     var y = parseInt(document.getElementById('editInfoCoordY').value);
     if (!isNaN(x)) action.x = x;
@@ -633,6 +634,53 @@ async function persistEditableSteps(source) {
   updateStepCount();
   renderActionList(actionHistory);
   chrome.runtime.sendMessage({ type: 'setActionHistory', steps: actionHistory }).catch(function() {});
+}
+
+async function startHoverStepCapture() {
+  try {
+    var tab = await getCurrentTab();
+    if (!tab || !tab.id) {
+      showToast('无法获取当前标签页');
+      return;
+    }
+    if (isRestrictedTabUrl(tab.url)) {
+      showToast('当前页面无法添加悬浮步骤');
+      return;
+    }
+
+    showToast('移动到目标位置并停留 3 秒');
+    var response = await chrome.tabs.sendMessage(tab.id, {
+      action: 'startHoverCapture',
+      options: { settleMs: 3000 }
+    });
+
+    if (!response || !response.success || !response.data) {
+      if (response && response.error) showToast(response.error === 'Hover capture canceled' ? '已取消添加悬浮' : response.error);
+      return;
+    }
+
+    var step = Object.assign({}, response.data, {
+      stepName: response.data.stepName || '鼠标悬浮',
+      pageUrl: currentPageUrl || tab.url || '',
+      pageTitle: currentPageTitle || tab.title || ''
+    });
+
+    if (isRecording) {
+      await chrome.runtime.sendMessage({ type: 'recordAction', data: step });
+    } else if (replaySteps && replaySteps.length) {
+      step.stepNumber = replaySteps.length + 1;
+      replaySteps.push(step);
+      persistEditableSteps('replay');
+    } else {
+      actionHistory.unshift(step);
+      persistEditableSteps('record');
+    }
+
+    showToast('已添加鼠标悬浮步骤');
+  } catch (error) {
+    console.error('添加悬浮步骤失败:', error);
+    showToast('添加悬浮步骤失败');
+  }
 }
 
 function saveWaitStep() {
@@ -947,6 +995,7 @@ function createActionCard(action, index, isReplayMode) {
   card.className = 'action-card ' + (action.type || '') + statusClass;
 
   var iconMap = {
+    hover: '🖱️',
     click: '🖱️', rightClick: '🖱️', dblclick: '🖱️',
     scroll: '📜', resize: '📏', focus: '🔍',
     input: '⌨️', keydown: '⌨️', submit: '📤', navigation: '🌐',
@@ -973,7 +1022,7 @@ function createActionCard(action, index, isReplayMode) {
 
   // 点击内容描述
   var actionDescription = '';
-  if (['click', 'rightClick', 'dblclick'].indexOf(action.type) !== -1 && target.textContent) {
+  if (['click', 'rightClick', 'dblclick', 'hover'].indexOf(action.type) !== -1 && target.textContent) {
     var text = String(target.textContent).trim();
     if (text) {
       var displayText = text.length > 25 ? text.substring(0, 25) + '...' : text;
@@ -1135,7 +1184,7 @@ function renderActionList(actions, isReplayMode) {
     filtered = actions.filter(function(a) {
       if (currentFilter === 'resize') return a.type === 'resize';
       if (currentFilter === 'scroll') return a.type === 'scroll';
-      if (currentFilter === 'click') return ['click', 'rightClick', 'dblclick'].indexOf(a.type) !== -1;
+      if (currentFilter === 'click') return ['click', 'rightClick', 'dblclick', 'hover'].indexOf(a.type) !== -1;
       return true;
     });
   }
@@ -2116,6 +2165,22 @@ function ensureAddWaitButton() {
   return button;
 }
 
+function ensureAddHoverButton() {
+  var existing = document.getElementById('addHoverStepBtn');
+  if (existing) return existing;
+  var footer = document.querySelector('.sidebar-footer');
+  if (!footer) return null;
+  var button = document.createElement('button');
+  button.id = 'addHoverStepBtn';
+  button.className = 'btn btn-hover';
+  button.type = 'button';
+  button.innerHTML = '<span>🖱️</span> 悬浮';
+  var waitButton = document.getElementById('addWaitStepBtn');
+  if (waitButton && waitButton.nextSibling) footer.insertBefore(button, waitButton.nextSibling);
+  else footer.insertBefore(button, footer.firstChild);
+  return button;
+}
+
 // ✅ 新增：检查回放是否完成
 function checkReplayCompletion() {
   // 检查是否还有待回放的步骤
@@ -2151,6 +2216,7 @@ function bindReplayEvents() {
   var replayPauseBtn = document.getElementById('replayPauseBtn');
   var replayStopBtn = document.getElementById('replayStopBtn');
   var addWaitStepBtn = ensureAddWaitButton();
+  var addHoverStepBtn = ensureAddHoverButton();
 
   // ✅ 清空日志按钮
   var clearLogBtn = document.getElementById('clearLogBtn');
@@ -2165,6 +2231,7 @@ function bindReplayEvents() {
   if (addWaitStepBtn) addWaitStepBtn.addEventListener('click', function() {
     openWaitDialog(-1, replaySteps && replaySteps.length ? 'replay' : 'record');
   });
+  if (addHoverStepBtn) addHoverStepBtn.addEventListener('click', startHoverStepCapture);
   if (fileInput) fileInput.addEventListener('change', handleFileSelect);
   if (closeReplayBtn) closeReplayBtn.addEventListener('click', closeReplayPanel);
 
