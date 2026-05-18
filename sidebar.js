@@ -200,15 +200,18 @@ async function startRecording() {
     currentPageTitle = tab.title;
     updateUrlDisplay(tab.url, tab.title);
     var startsOnRestrictedPage = isRestrictedTabUrl(tab.url);
-    var initialSteps = [];
+    if (isReplaying || isReplayPaused) {
+      await stopReplayInPage();
+    }
+    var initialSteps = replaySteps && replaySteps.length ? cloneStepsForRecording(normalizeReplaySteps(replaySteps)) : [];
 
-    await chrome.runtime.sendMessage({ type: 'clearHistory' });
-    actionHistory = [];
-    replaySteps = [];
-    continuationSteps = [];
-    continuationSessionId = null;
-    currentReplaySessionId = null;
-    stepCounter = 0;
+    if (initialSteps.length === 0) {
+      await chrome.runtime.sendMessage({ type: 'clearHistory' });
+      actionHistory = [];
+    } else {
+      actionHistory = [].concat(initialSteps).reverse();
+    }
+    stepCounter = actionHistory.length;
     stepResults = {};
     updateStepCount();
     renderActionList(actionHistory);
@@ -225,6 +228,9 @@ async function startRecording() {
       isRecording = true;
       currentSessionId = response.sessionId;
       currentReplaySessionId = null;
+      replaySteps = [];
+      continuationSteps = [];
+      continuationSessionId = null;
       currentFileName = response.fileName || '';
       recordingStartTime = Date.now();
 
@@ -1322,13 +1328,23 @@ async function confirmExport() {
 }
 
 async function clearHistory() {
+  if (isReplaying || isReplayPaused) {
+    await stopReplayInPage();
+  }
   await chrome.runtime.sendMessage({ type: 'clearHistory' });
   actionHistory = [];
+  replaySteps = [];
   stepCounter = 0;
   stepResults = {};
   currentReplaySessionId = null;
   continuationSteps = [];
   continuationSessionId = null;
+  isReplaying = false;
+  isReplayPaused = false;
+  replayIsNavigating = false;
+  clearReplayStorage();
+  var replayPanel = document.getElementById('replayPanel');
+  if (replayPanel) replayPanel.classList.add('hidden');
   updateStepCount();
   renderActionList(actionHistory);
   showToast('???');
@@ -1529,11 +1545,9 @@ function showReplayPanel(fileName, steps) {
   updateReplayButtons(false);
 }
 
-function closeReplayPanel() {
-  stopReplayInPage();
+async function closeReplayPanel() {
+  await stopReplayInPage();
 
-  replaySteps = [];
-  currentReplaySessionId = null;
   isReplaying = false;
   isReplayPaused = false;
   replayIsNavigating = false;
@@ -1547,6 +1561,14 @@ function closeReplayPanel() {
   renderActionList(actionHistory);
 
   // ✅ 额外清理一次
+  if (replaySteps && replaySteps.length) {
+    actionHistory = [].concat(cloneStepsForRecording(replaySteps)).reverse();
+    stepCounter = actionHistory.length;
+    updateStepCount();
+    renderActionList(actionHistory);
+  } else {
+    renderActionList(actionHistory);
+  }
   clearReplayStorage();
   addReplayLog('回放面板已关闭', 'info');
 }

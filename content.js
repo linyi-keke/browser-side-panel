@@ -625,7 +625,6 @@
       };
 
       sendAction(actionData);
-      console.log('inject replay script failed:', e);
 
       // 清理
       pendingInputValues.delete(inputKey);
@@ -749,7 +748,6 @@
         }
       };
       sendAction(actionData);
-      console.log('inject replay script failed:', e);
     }
   });
 

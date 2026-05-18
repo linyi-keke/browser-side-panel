@@ -140,6 +140,77 @@
     element.dispatchEvent(new Event('change', { bubbles: true }));
   };
 
+  ActionReplayer.prototype.dispatchPointerMouseEvent = function(element, type, x, y, options) {
+    options = options || {};
+    var eventOptions = Object.assign({
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      screenX: window.screenX + x,
+      screenY: window.screenY + y,
+      button: 0,
+      buttons: type === 'mouseup' || type === 'pointerup' || type === 'click' ? 0 : 1,
+      detail: type === 'click' ? 1 : 0
+    }, options);
+
+    if (type.indexOf('pointer') === 0 && typeof PointerEvent === 'function') {
+      element.dispatchEvent(new PointerEvent(type, Object.assign({}, eventOptions, {
+        pointerId: 1,
+        pointerType: 'mouse',
+        isPrimary: true
+      })));
+      return;
+    }
+
+    element.dispatchEvent(new MouseEvent(type, eventOptions));
+  };
+
+  ActionReplayer.prototype.dispatchRealisticClick = function(element, x, y) {
+    var pointElement = document.elementFromPoint(x, y) || element;
+    var dispatchTarget = element.contains && element.contains(pointElement) ? pointElement : element;
+
+    this.dispatchPointerMouseEvent(dispatchTarget, 'pointerover', x, y);
+    this.dispatchPointerMouseEvent(dispatchTarget, 'pointerenter', x, y, { bubbles: false });
+    this.dispatchPointerMouseEvent(dispatchTarget, 'mouseover', x, y);
+    this.dispatchPointerMouseEvent(dispatchTarget, 'mouseenter', x, y, { bubbles: false });
+    this.dispatchPointerMouseEvent(dispatchTarget, 'pointermove', x, y);
+    this.dispatchPointerMouseEvent(dispatchTarget, 'mousemove', x, y);
+    this.dispatchPointerMouseEvent(dispatchTarget, 'pointerdown', x, y);
+    this.dispatchPointerMouseEvent(dispatchTarget, 'mousedown', x, y);
+    if (typeof dispatchTarget.focus === 'function') {
+      try { dispatchTarget.focus({ preventScroll: true }); } catch (e) { dispatchTarget.focus(); }
+    }
+    this.dispatchPointerMouseEvent(dispatchTarget, 'pointerup', x, y);
+    this.dispatchPointerMouseEvent(dispatchTarget, 'mouseup', x, y);
+    this.dispatchPointerMouseEvent(dispatchTarget, 'click', x, y);
+
+    if (dispatchTarget !== element) {
+      this.dispatchPointerMouseEvent(element, 'click', x, y);
+    }
+  };
+
+  ActionReplayer.prototype.dispatchExpandableFallback = async function(element, step) {
+    var expandable = element && element.closest ? element.closest('[aria-haspopup="true"], .ant-menu-submenu-title') : null;
+    if (!expandable) return;
+
+    var before = expandable.getAttribute('aria-expanded');
+    if (before === 'true') return;
+    await new Promise(function(r) { setTimeout(r, 120); });
+    if (expandable.getAttribute('aria-expanded') === 'true') return;
+
+    this.log('Expandable menu still closed; trying keyboard fallback', 'info', step);
+    if (typeof expandable.focus === 'function') {
+      try { expandable.focus({ preventScroll: true }); } catch (e) { expandable.focus(); }
+    }
+    ['Enter', ' '].forEach(function(key) {
+      expandable.dispatchEvent(new KeyboardEvent('keydown', { key: key, code: key === ' ' ? 'Space' : 'Enter', bubbles: true, cancelable: true, composed: true }));
+      expandable.dispatchEvent(new KeyboardEvent('keyup', { key: key, code: key === ' ' ? 'Space' : 'Enter', bubbles: true, cancelable: true, composed: true }));
+    });
+  };
+
   ActionReplayer.prototype.setContentEditableText = async function(element, value) {
     element.focus();
     var selection = window.getSelection();
@@ -175,6 +246,21 @@
     return String(text || '').replace(/\s+/g, ' ').trim();
   };
 
+  ActionReplayer.prototype.compactText = function(text) {
+    return this.normalizeText(text).replace(/\s+/g, '');
+  };
+
+  ActionReplayer.prototype.textContainsExpected = function(actual, expected) {
+    actual = this.normalizeText(actual);
+    expected = this.normalizeText(expected);
+    if (!expected) return true;
+    if (actual === expected || actual.indexOf(expected) >= 0) return true;
+
+    var compactActual = this.compactText(actual);
+    var compactExpected = this.compactText(expected);
+    return compactExpected && (compactActual === compactExpected || compactActual.indexOf(compactExpected) >= 0);
+  };
+
   ActionReplayer.prototype.getExpectedPoint = function(step) {
     if (!step || step.x === undefined || step.y === undefined) return null;
     var scaleX = step.viewportWidth ? (window.innerWidth / step.viewportWidth) : 1;
@@ -200,6 +286,8 @@
       if (expectedText) {
         if (text === expectedText) score += 1000;
         else if (text.indexOf(expectedText) >= 0) score += 500;
+        else if (this.compactText(text) === this.compactText(expectedText)) score += 900;
+        else if (this.compactText(text).indexOf(this.compactText(expectedText)) >= 0) score += 450;
         else continue;
       }
       if (expectedPoint) {
@@ -474,7 +562,7 @@
     if (target.id) {
       element = document.getElementById(target.id);
       if (element) {
-        if (!target.textContent || this.normalizeText(element.textContent || element.value || '').indexOf(this.normalizeText(target.textContent)) >= 0) return element;
+        if (!target.textContent || this.textContainsExpected(element.textContent || element.value || '', target.textContent)) return element;
       }
     }
     if (target.name) {
@@ -500,7 +588,7 @@
       var textMatches = [];
       for (var i = 0; i < allElements.length; i++) {
         var el = allElements[i];
-        if (this.normalizeText(el.textContent || el.value || '') === searchText) {
+        if (this.textContainsExpected(el.textContent || el.value || '', searchText)) {
           textMatches.push(el);
         }
       }
@@ -514,7 +602,7 @@
         if (target.textContent) {
           var expectedText = this.normalizeText(target.textContent);
           var actualText = this.normalizeText(element.textContent || element.value || '');
-          if (actualText && actualText !== expectedText && actualText.indexOf(expectedText) < 0) {
+          if (actualText && !this.textContainsExpected(actualText, expectedText)) {
             this.log('Coordinate text mismatch; refusing click: ' + actualText, 'fail', step);
             return null;
           }
@@ -682,7 +770,7 @@
       if (element && step.target && step.target.textContent) {
         var expectedText = this.normalizeText(step.target.textContent);
         var actualText = this.normalizeText(element.textContent || element.value || '');
-        if (actualText && actualText !== expectedText && actualText.indexOf(expectedText) < 0) {
+        if (actualText && !this.textContainsExpected(actualText, expectedText)) {
           this.log('Click fallback text mismatch; refusing coordinate click: ' + actualText, 'fail', step);
           element = null;
         }
@@ -723,12 +811,11 @@
         centerX = rect.left + Math.max(0, Math.min(rect.width, step.target.clickOffsetX));
         centerY = rect.top + Math.max(0, Math.min(rect.height, step.target.clickOffsetY));
       }
-      element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: centerX, clientY: centerY, view: window }));
-      element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: centerX, clientY: centerY, view: window }));
-      element.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: centerX, clientY: centerY, view: window }));
+      this.dispatchRealisticClick(element, centerX, centerY);
       if (typeof element.click === 'function') {
         element.click();
       }
+      await this.dispatchExpandableFallback(element, step);
       this.createHighlight(centerX, centerY);
       this.log('Click succeeded at (' + Math.round(centerX) + ', ' + Math.round(centerY) + ') on ' + describeElement(element), 'success', step);
       console.log('点击成功:', element.tagName, element.className);

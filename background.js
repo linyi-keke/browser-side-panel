@@ -154,6 +154,31 @@ function cloneInitialActions(actions) {
   });
 }
 
+function getInputActionKey(action) {
+  if (!action || action.type !== 'input') return '';
+  var target = action.target || {};
+  return target.selector || target.id || target.name || '';
+}
+
+function canMergeInputAction(previous, next) {
+  var previousKey = getInputActionKey(previous);
+  var nextKey = getInputActionKey(next);
+  if (!previousKey || !nextKey || previousKey !== nextKey) return false;
+  if (previous.tabId && next.tabId && previous.tabId !== next.tabId) return false;
+  if (previous.pageUrl && next.pageUrl && previous.pageUrl !== next.pageUrl) return false;
+  return true;
+}
+
+function mergeInputAction(previous, next) {
+  var merged = Object.assign({}, previous, next);
+  merged.target = Object.assign({}, previous.target || {}, next.target || {});
+  if (previous.previousValue !== undefined) merged.previousValue = previous.previousValue;
+  if (previous.stepName && !next.stepName) merged.stepName = previous.stepName;
+  if (previous.assertions && !next.assertions) merged.assertions = previous.assertions;
+  if (previous.stepNumber != null && next.stepNumber == null) merged.stepNumber = previous.stepNumber;
+  return merged;
+}
+
 function getSessionActionIndexFromHistoryIndex(historyIndex, historyItem) {
   if (!currentSessionId || !recordingSessions[currentSessionId]) return -1;
   var actions = recordingSessions[currentSessionId].actions || [];
@@ -355,7 +380,16 @@ async function recordAction(action, senderTabId) {
     }
   }
 
-  actionHistory.unshift(action);
+  var timeOffset = Date.now() - new Date(recordingSessions[currentSessionId].startTime).getTime();
+  var shouldReplaceLatestInput = action.type === 'input' &&
+    actionHistory.length > 0 &&
+    canMergeInputAction(actionHistory[0], action);
+
+  if (shouldReplaceLatestInput) {
+    actionHistory[0] = mergeInputAction(actionHistory[0], action);
+  } else {
+    actionHistory.unshift(action);
+  }
 
   if (actionHistory.length > 200) actionHistory.length = 200;
 
@@ -367,9 +401,17 @@ async function recordAction(action, senderTabId) {
   }).catch(function() {});
 
   if (isRecording && currentSessionId && recordingSessions[currentSessionId]) {
-    var timeOffset = Date.now() - new Date(recordingSessions[currentSessionId].startTime).getTime();
+    var sessionActions = recordingSessions[currentSessionId].actions || [];
+    var sessionAction = Object.assign({}, action, { timeOffset: timeOffset });
 
-    recordingSessions[currentSessionId].actions.push(Object.assign({}, action, { timeOffset: timeOffset }));
+    if (action.type === 'input' &&
+        sessionActions.length > 0 &&
+        canMergeInputAction(sessionActions[sessionActions.length - 1], sessionAction)) {
+      sessionActions[sessionActions.length - 1] = mergeInputAction(sessionActions[sessionActions.length - 1], sessionAction);
+    } else {
+      sessionActions.push(sessionAction);
+    }
+    recordingSessions[currentSessionId].actions = sessionActions;
 
     await saveSessionToStorage(currentSessionId);
   }
