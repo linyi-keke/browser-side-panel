@@ -20,6 +20,8 @@
   var assertionSuppressEventsUntil = 0;
   var hoverCaptureActive = false;
   var hoverCaptureState = null;
+  var coordinateEditActive = false;
+  var coordinateEditState = null;
   var userScrollUntil = 0;
   console.log('Content Script initialized');
   // update window info
@@ -136,6 +138,64 @@
 
   function getElementText(el) {
     return getAccessibleText(el).substring(0, 100);
+  }
+
+  function getPointTarget(x, y, ignoredElements) {
+    ignoredElements = ignoredElements || [];
+    var hidden = [];
+
+    ignoredElements.forEach(function(el) {
+      if (!el || !el.style) return;
+      hidden.push({ el: el, pointerEvents: el.style.pointerEvents, visibility: el.style.visibility });
+      el.style.pointerEvents = 'none';
+      el.style.visibility = 'hidden';
+    });
+
+    var target = document.elementFromPoint(x, y);
+
+    hidden.forEach(function(item) {
+      item.el.style.pointerEvents = item.pointerEvents;
+      item.el.style.visibility = item.visibility;
+    });
+
+    return target;
+  }
+
+  function buildCoordinateEditData(type, x, y, ignoredElements) {
+    var target = getPointTarget(x, y, ignoredElements) || document.body || document.documentElement;
+    var rect = target && target.getBoundingClientRect ? target.getBoundingClientRect() : null;
+
+    return {
+      type: type,
+      x: x,
+      y: y,
+      pageX: x + window.scrollX,
+      pageY: y + window.scrollY,
+      viewportWidth: document.documentElement.clientWidth,
+      viewportHeight: document.documentElement.clientHeight,
+      windowWidth: window.innerWidth,
+      windowHeight: window.innerHeight,
+      pageUrl: window.location.href,
+      pageTitle: document.title,
+      target: target ? {
+        tagName: target.tagName || '',
+        id: target.id || '',
+        className: (target.className && typeof target.className === 'string') ? target.className : '',
+        textContent: getElementText(target),
+        type: target.type || '',
+        name: target.name || '',
+        placeholder: target.placeholder || '',
+        selector: getElementSelector(target),
+        rect: rect ? {
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height
+        } : null,
+        clickOffsetX: rect ? x - rect.left : null,
+        clickOffsetY: rect ? y - rect.top : null
+      } : null
+    };
   }
 
   function isSemanticClickTarget(el) {
@@ -511,6 +571,140 @@
     document.addEventListener('keydown', hoverCaptureState.onKeyDown, true);
   }
 
+  function cleanupCoordinateEdit() {
+    if (!coordinateEditState) {
+      coordinateEditActive = false;
+      return;
+    }
+    document.removeEventListener('mousemove', coordinateEditState.onMouseMove, true);
+    document.removeEventListener('mouseup', coordinateEditState.onMouseUp, true);
+    document.removeEventListener('keydown', coordinateEditState.onKeyDown, true);
+    if (coordinateEditState.overlay) coordinateEditState.overlay.remove();
+    coordinateEditState = null;
+    coordinateEditActive = false;
+    assertionSuppressEventsUntil = Date.now() + 500;
+  }
+
+  function startCoordinateEdit(options, done) {
+    cleanupCoordinateEdit();
+    coordinateEditActive = true;
+
+    var initialX = Number(options && options.x);
+    var initialY = Number(options && options.y);
+    if (!isFinite(initialX)) initialX = Math.round(window.innerWidth / 2);
+    if (!isFinite(initialY)) initialY = Math.round(window.innerHeight / 2);
+    initialX = Math.max(0, Math.min(window.innerWidth - 1, Math.round(initialX)));
+    initialY = Math.max(0, Math.min(window.innerHeight - 1, Math.round(initialY)));
+
+    var overlay = document.createElement('div');
+    overlay.id = '__coordinate_edit_overlay__';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,0.08);cursor:crosshair;';
+
+    var marker = document.createElement('div');
+    marker.style.cssText = 'position:fixed;width:18px;height:18px;border-radius:50%;background:#ef4444;border:3px solid #fff;box-shadow:0 0 0 5px rgba(239,68,68,.28),0 12px 28px rgba(15,23,42,.35);transform:translate(-50%,-50%);cursor:grab;';
+
+    var crosshairH = document.createElement('div');
+    crosshairH.style.cssText = 'position:fixed;height:1px;background:rgba(239,68,68,.72);left:0;right:0;pointer-events:none;';
+    var crosshairV = document.createElement('div');
+    crosshairV.style.cssText = 'position:fixed;width:1px;background:rgba(239,68,68,.72);top:0;bottom:0;pointer-events:none;';
+
+    var panel = document.createElement('div');
+    panel.style.cssText = 'position:fixed;left:16px;top:16px;min-width:210px;padding:10px;border-radius:8px;background:#111827;color:#f8fafc;font:12px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;box-shadow:0 10px 28px rgba(15,23,42,.35);';
+
+    var text = document.createElement('div');
+    text.style.cssText = 'margin-bottom:8px;';
+
+    var confirmBtn = document.createElement('button');
+    confirmBtn.textContent = '\u786e\u8ba4';
+    confirmBtn.style.cssText = 'border:0;border-radius:6px;background:#2563eb;color:#fff;padding:6px 12px;margin-right:8px;cursor:pointer;font:12px system-ui,-apple-system,Segoe UI,sans-serif;';
+
+    var cancelBtn = document.createElement('button');
+    cancelBtn.textContent = '\u53d6\u6d88';
+    cancelBtn.style.cssText = 'border:1px solid rgba(148,163,184,.35);border-radius:6px;background:rgba(30,41,59,.9);color:#cbd5e1;padding:5px 11px;cursor:pointer;font:12px system-ui,-apple-system,Segoe UI,sans-serif;';
+
+    panel.appendChild(text);
+    panel.appendChild(confirmBtn);
+    panel.appendChild(cancelBtn);
+    overlay.appendChild(crosshairH);
+    overlay.appendChild(crosshairV);
+    overlay.appendChild(marker);
+    overlay.appendChild(panel);
+    document.documentElement.appendChild(overlay);
+
+    function place(x, y) {
+      coordinateEditState.x = Math.max(0, Math.min(window.innerWidth - 1, Math.round(x)));
+      coordinateEditState.y = Math.max(0, Math.min(window.innerHeight - 1, Math.round(y)));
+      marker.style.left = coordinateEditState.x + 'px';
+      marker.style.top = coordinateEditState.y + 'px';
+      crosshairH.style.top = coordinateEditState.y + 'px';
+      crosshairV.style.left = coordinateEditState.x + 'px';
+      text.textContent = '\u62d6\u52a8\u7ea2\u70b9\u6216\u70b9\u51fb\u9875\u9762\u6539\u5750\u6807\uff1a(' + coordinateEditState.x + ', ' + coordinateEditState.y + ')\uff0cEsc \u53d6\u6d88';
+    }
+
+    function finish(result) {
+      cleanupCoordinateEdit();
+      try { done(result); } catch (e) {}
+    }
+
+    coordinateEditState = {
+      overlay: overlay,
+      x: initialX,
+      y: initialY,
+      dragging: false,
+      onMouseMove: function(e) {
+        if (!coordinateEditState || !coordinateEditState.dragging) return;
+        e.preventDefault();
+        e.stopPropagation();
+        place(e.clientX, e.clientY);
+      },
+      onMouseUp: function(e) {
+        if (!coordinateEditState) return;
+        if (coordinateEditState.dragging) {
+          e.preventDefault();
+          e.stopPropagation();
+          coordinateEditState.dragging = false;
+          marker.style.cursor = 'grab';
+        }
+      },
+      onKeyDown: function(e) {
+        if (e.key !== 'Escape') return;
+        e.preventDefault();
+        e.stopPropagation();
+        finish({ success: false, error: 'Coordinate edit canceled' });
+      }
+    };
+
+    overlay.addEventListener('mousedown', function(e) {
+      if (e.target === confirmBtn || e.target === cancelBtn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      coordinateEditState.dragging = true;
+      marker.style.cursor = 'grabbing';
+      place(e.clientX, e.clientY);
+    }, true);
+
+    confirmBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var ignored = [overlay, marker, crosshairH, crosshairV, panel];
+      finish({
+        success: true,
+        data: buildCoordinateEditData(options && options.type, coordinateEditState.x, coordinateEditState.y, ignored)
+      });
+    }, true);
+
+    cancelBtn.addEventListener('click', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      finish({ success: false, error: 'Coordinate edit canceled' });
+    }, true);
+
+    document.addEventListener('mousemove', coordinateEditState.onMouseMove, true);
+    document.addEventListener('mouseup', coordinateEditState.onMouseUp, true);
+    document.addEventListener('keydown', coordinateEditState.onKeyDown, true);
+    place(initialX, initialY);
+  }
+
   function recordNavigationStep() {
     var actionData = {
       type: 'navigation',
@@ -535,7 +729,8 @@
 
   // 监听点击
   document.addEventListener('click', function(e) {
-    if (assertionSelectActive || hoverCaptureActive || Date.now() < assertionSuppressEventsUntil) {
+    if (coordinateEditActive && coordinateEditState && coordinateEditState.overlay && coordinateEditState.overlay.contains(e.target)) return;
+    if (assertionSelectActive || hoverCaptureActive || coordinateEditActive || Date.now() < assertionSuppressEventsUntil) {
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -555,7 +750,8 @@
 
   // 监听右键
   document.addEventListener('contextmenu', function(e) {
-    if (assertionSelectActive || hoverCaptureActive || Date.now() < assertionSuppressEventsUntil) {
+    if (coordinateEditActive && coordinateEditState && coordinateEditState.overlay && coordinateEditState.overlay.contains(e.target)) return;
+    if (assertionSelectActive || hoverCaptureActive || coordinateEditActive || Date.now() < assertionSuppressEventsUntil) {
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -566,7 +762,8 @@
 
   // 监听双击
   document.addEventListener('dblclick', function(e) {
-    if (assertionSelectActive || hoverCaptureActive || Date.now() < assertionSuppressEventsUntil) {
+    if (coordinateEditActive && coordinateEditState && coordinateEditState.overlay && coordinateEditState.overlay.contains(e.target)) return;
+    if (assertionSelectActive || hoverCaptureActive || coordinateEditActive || Date.now() < assertionSuppressEventsUntil) {
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -795,6 +992,15 @@
 
     if (request.action === 'startHoverCapture') {
       startHoverCapture(request.options || {}, function(result) {
+        try {
+          sendResponse(result);
+        } catch (e) {}
+      });
+      return true;
+    }
+
+    if (request.action === 'startCoordinateEdit') {
+      startCoordinateEdit(request.options || {}, function(result) {
         try {
           sendResponse(result);
         } catch (e) {}

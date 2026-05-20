@@ -782,6 +782,17 @@ body {
 .coord-edit-item { flex: 1; }
 .coord-label { display: block; font-size: 10px; color: #64748b; margin-bottom: 2px; text-transform: uppercase; }
 .form-input-small { width: 100%; padding: 6px 8px !important; }
+.btn-pick-coordinate {
+  width: 100%;
+  margin-top: 8px;
+  background: rgba(239, 68, 68, 0.14);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.28);
+}
+.btn-pick-coordinate:hover {
+  background: rgba(239, 68, 68, 0.22);
+  color: #fecaca;
+}
 
 .assertion-dialog {
   max-width: 390px;

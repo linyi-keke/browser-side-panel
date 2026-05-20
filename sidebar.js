@@ -78,6 +78,7 @@ var editStepInfoDialog = document.getElementById('editStepInfoDialog');
 var closeEditInfoDialogBtn = document.getElementById('closeEditInfoDialogBtn');
 var cancelEditInfoBtn = document.getElementById('cancelEditInfoBtn');
 var confirmEditInfoBtn = document.getElementById('confirmEditInfoBtn');
+var editInfoPickCoordBtn = document.getElementById('editInfoPickCoordBtn');
 
 
 // ==================== 日志功能 ====================
@@ -384,6 +385,56 @@ function openEditStepDialog(index) {
 function closeEditStepDialog() {
   editStepInfoDialog.classList.add('hidden');
   editInfoStepIndex = -1;
+}
+
+async function startEditCoordinate() {
+  if (editInfoStepIndex < 0 || editInfoStepIndex >= actionHistory.length) return;
+
+  var action = actionHistory[editInfoStepIndex];
+  if (['click', 'rightClick', 'dblclick', 'hover'].indexOf(action.type) === -1) return;
+
+  try {
+    var tab = await getCurrentTab();
+    if (!tab || !tab.id) {
+      showToast('无法获取当前标签页');
+      return;
+    }
+    if (isRestrictedTabUrl(tab.url)) {
+      showToast('当前页面无法修改坐标');
+      return;
+    }
+
+    showToast('在页面拖动红点，点击确认保存坐标');
+    var response = await chrome.tabs.sendMessage(tab.id, {
+      action: 'startCoordinateEdit',
+      options: {
+        type: action.type,
+        x: action.x,
+        y: action.y
+      }
+    });
+
+    if (!response || !response.success || !response.data) {
+      if (response && response.error && response.error !== 'Coordinate edit canceled') showToast(response.error);
+      return;
+    }
+
+    action = Object.assign({}, action, response.data, {
+      stepName: document.getElementById('editInfoStepName').value.trim() || null,
+      timestamp: new Date().toISOString()
+    });
+    actionHistory[editInfoStepIndex] = action;
+
+    document.getElementById('editInfoCoordX').value = action.x;
+    document.getElementById('editInfoCoordY').value = action.y;
+
+    chrome.runtime.sendMessage({ type: 'updateStepInfo', index: editInfoStepIndex, data: action }).catch(function() {});
+    renderActionList(actionHistory);
+    showToast('坐标和目标信息已更新');
+  } catch (error) {
+    console.error('修改坐标失败:', error);
+    showToast('修改坐标失败');
+  }
 }
 
 function saveStepInfo() {
@@ -1174,6 +1225,10 @@ function createActionCard(action, index, isReplayMode) {
 
 // ==================== 渲染列表 ====================
 
+function shouldDisplayAction(action) {
+  return action && action.type !== 'focus';
+}
+
 function renderActionList(actions, isReplayMode) {
   isReplayMode = isReplayMode || false;
   if (!actionList) return;
@@ -1185,9 +1240,10 @@ function renderActionList(actions, isReplayMode) {
     return;
   }
 
-  var filtered = actions;
+  var filtered = actions.filter(shouldDisplayAction);
   if (!isReplayMode && currentFilter !== 'all') {
     filtered = actions.filter(function(a) {
+      if (!shouldDisplayAction(a)) return false;
       if (currentFilter === 'resize') return a.type === 'resize';
       if (currentFilter === 'scroll') return a.type === 'scroll';
       if (currentFilter === 'click') return ['click', 'rightClick', 'dblclick', 'hover'].indexOf(a.type) !== -1;
@@ -1217,9 +1273,14 @@ function renderReplayList() {
   }
 
   // ✅ 确保 replaySteps 按 stepNumber 升序排列
-  var sortedSteps = [].concat(replaySteps).sort(function(a, b) {
+  var sortedSteps = [].concat(replaySteps).filter(shouldDisplayAction).sort(function(a, b) {
     return (a.stepNumber || 0) - (b.stepNumber || 0);
   });
+
+  if (sortedSteps.length === 0) {
+    actionList.innerHTML = '<div class="empty-state"><div class="empty-icon">📊</div><p>没有可展示的回放步骤</p></div>';
+    return;
+  }
 
   // ✅ 显示顺序：步骤1在最上面（不要反转）
   // 因为回放时是从数组头部开始执行的，所以直接按升序渲染
@@ -2285,6 +2346,7 @@ editStepDialog.addEventListener('click', function(e) { if (e.target === editStep
 if (closeEditInfoDialogBtn) closeEditInfoDialogBtn.addEventListener('click', closeEditStepDialog);
 if (cancelEditInfoBtn) cancelEditInfoBtn.addEventListener('click', closeEditStepDialog);
 if (confirmEditInfoBtn) confirmEditInfoBtn.addEventListener('click', saveStepInfo);
+if (editInfoPickCoordBtn) editInfoPickCoordBtn.addEventListener('click', startEditCoordinate);
 if (editStepInfoDialog) editStepInfoDialog.addEventListener('click', function(e) { if (e.target === editStepInfoDialog) closeEditStepDialog(); });
 
 fileNameInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') confirmExport(); if (e.key === 'Escape') closeExportDialog(); });
