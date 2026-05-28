@@ -186,10 +186,20 @@
     this.dispatchPointerMouseEvent(dispatchTarget, 'pointerup', x, y);
     this.dispatchPointerMouseEvent(dispatchTarget, 'mouseup', x, y);
     this.dispatchPointerMouseEvent(dispatchTarget, 'click', x, y);
+  };
 
-    if (dispatchTarget !== element) {
-      this.dispatchPointerMouseEvent(element, 'click', x, y);
+  ActionReplayer.prototype.getClickableAncestor = function(element) {
+    if (!element || !element.closest) return null;
+    return element.closest('a[href], button, summary, label, [role="button"], [role="link"], [role="tab"], [onclick], .ant-btn, .ant-dropdown-trigger, .ant-segmented-item, .ant-menu-item');
+  };
+
+  ActionReplayer.prototype.clickElementAndAncestor = function(element, x, y) {
+    var clickable = this.getClickableAncestor(element);
+    var clickTarget = clickable || element;
+    if (clickTarget !== element) {
+      this.log('Click redirected to clickable ancestor: ' + describeElement(clickTarget), 'info');
     }
+    this.dispatchRealisticClick(clickTarget, x, y);
   };
 
   ActionReplayer.prototype.dispatchExpandableFallback = async function(element, step) {
@@ -319,6 +329,42 @@
     }
   };
 
+  ActionReplayer.prototype.urlMatchesTarget = function(url) {
+    if (!url) return true;
+    try {
+      var current = new URL(window.location.href);
+      var expected = new URL(url, window.location.href);
+      return current.origin === expected.origin && current.pathname === expected.pathname;
+    } catch (e) {
+      return String(window.location.href).indexOf(String(url)) === 0;
+    }
+  };
+
+  ActionReplayer.prototype.isNavigationDrivenByPreviousAction = function(step) {
+    if (!step || step.type !== 'navigation' || this.currentIndex <= 0) return false;
+    var previous = this.steps[this.currentIndex - 1];
+    if (!previous || ['click', 'dblclick', 'keydown', 'submit'].indexOf(previous.type) === -1) return false;
+    var targetUrl = step.url || step.pageUrl;
+    var previousUrl = previous.pageUrl || previous.url;
+    if (!targetUrl || !previousUrl) return true;
+    try {
+      var target = new URL(targetUrl, window.location.href);
+      var previousPage = new URL(previousUrl, window.location.href);
+      return target.origin !== previousPage.origin || target.pathname !== previousPage.pathname;
+    } catch (e) {
+      return String(targetUrl).split('#')[0] !== String(previousUrl).split('#')[0];
+    }
+  };
+
+  ActionReplayer.prototype.waitForUrlTarget = async function(url, timeoutMs) {
+    var start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (this.urlMatchesTarget(url)) return true;
+      await new Promise(function(r) { setTimeout(r, 250); });
+    }
+    return this.urlMatchesTarget(url);
+  };
+
   ActionReplayer.prototype.waitForStepPage = async function(step, timeoutMs) {
     if (!step || !step.pageUrl || step.type === 'navigation') return true;
     var start = Date.now();
@@ -328,6 +374,27 @@
     }
     this.log('Page URL still differs from recorded step: current=' + window.location.href + ', recorded=' + step.pageUrl, 'info', step);
     return false;
+  };
+
+  ActionReplayer.prototype.shouldResumeRemainingStepsElsewhere = function(step, remainingSteps) {
+    if (!remainingSteps || remainingSteps.length === 0) return false;
+    var nextStep = remainingSteps[0];
+    var nextUrl = nextStep.type === 'navigation' ? (nextStep.url || nextStep.pageUrl) : nextStep.pageUrl;
+    if (!nextUrl) return false;
+    var currentStepUrl = step && (step.pageUrl || step.url);
+    try {
+      var current = new URL(currentStepUrl || window.location.href, window.location.href);
+      var next = new URL(nextUrl, window.location.href);
+      return current.origin !== next.origin || current.pathname !== next.pathname;
+    } catch (e) {
+      return String(nextUrl).split('#')[0] !== String(currentStepUrl || window.location.href).split('#')[0];
+    }
+  };
+
+  ActionReplayer.prototype.getResumeTargetUrl = function(remainingSteps) {
+    if (!remainingSteps || remainingSteps.length === 0) return '';
+    var nextStep = remainingSteps[0];
+    return nextStep.type === 'navigation' ? (nextStep.url || nextStep.pageUrl || '') : (nextStep.pageUrl || '');
   };
 
   ActionReplayer.prototype.waitForElement = async function(step, timeoutMs) {
@@ -656,6 +723,17 @@
         return true;
       }
 
+      if (this.isNavigationDrivenByPreviousAction(step)) {
+        this.log('Navigation follows a user action; waiting for that action to change the page instead of opening the URL directly', 'navigate', step);
+        var reachedByAction = await this.waitForUrlTarget(url, 6000);
+        if (reachedByAction) {
+          this.log('Navigation reached by previous action', 'success', step);
+          return true;
+        }
+        this.log('Navigation was not reached by previous action; refusing direct URL open so the click failure is visible', 'fail', step);
+        return false;
+      }
+
       var remainingSteps = [step];
       for (var i = this.currentIndex + 1; i < this.steps.length; i++) {
         remainingSteps.push(this.steps[i]);
@@ -790,16 +868,15 @@
       for (var i = this.currentIndex + 1; i < this.steps.length; i++) {
         remainingSteps.push(this.steps[i]);
       }
-      if (remainingSteps.length > 0) {
+      var resumeElsewhere = this.shouldResumeRemainingStepsElsewhere(step, remainingSteps);
+      var resumeTargetUrl = this.getResumeTargetUrl(remainingSteps);
+      if (resumeElsewhere) {
         await savePendingReplay({
           steps: remainingSteps,
           speed: this.speed,
           currentIndex: 0,
           totalSteps: this.steps.length
         });
-        setTimeout(function() {
-          if (window.__replayer && window.__replayer.isReplaying) clearPendingReplay();
-        }, 2500);
       }
       this.log('Prepare click on ' + describeElement(element), 'executing', step);
       element.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -811,12 +888,20 @@
         centerX = rect.left + Math.max(0, Math.min(rect.width, step.target.clickOffsetX));
         centerY = rect.top + Math.max(0, Math.min(rect.height, step.target.clickOffsetY));
       }
-      this.dispatchRealisticClick(element, centerX, centerY);
-      if (typeof element.click === 'function') {
-        element.click();
-      }
+      this.clickElementAndAncestor(element, centerX, centerY);
       await this.dispatchExpandableFallback(element, step);
       this.createHighlight(centerX, centerY);
+      if (resumeElsewhere) {
+        var reachedInCurrentContext = await this.waitForUrlTarget(resumeTargetUrl, 3000);
+        if (reachedInCurrentContext) {
+          await clearPendingReplay();
+          this.log('Click changed current page to next step URL; continuing in current replayer', 'navigate', step);
+        } else {
+          this.isReplaying = false;
+          sendUniqueMessage('replayStatus', { status: 'navigating' }, 'nav_click_' + (step.stepNumber || this.currentIndex));
+          this.log('Click may open another page/tab; current page replayer stopped and remaining steps saved', 'navigate', step);
+        }
+      }
       this.log('Click succeeded at (' + Math.round(centerX) + ', ' + Math.round(centerY) + ') on ' + describeElement(element), 'success', step);
       console.log('点击成功:', element.tagName, element.className);
       return true;

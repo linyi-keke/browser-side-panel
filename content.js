@@ -2,6 +2,12 @@
 (function() {
   'use strict';
 
+  if (window.__browserSidePanelContentLoaded) {
+    console.log('Content Script already initialized, skip duplicate instance');
+    return;
+  }
+  window.__browserSidePanelContentLoaded = true;
+
   var windowInfo = {
     windowWidth: window.innerWidth,
     windowHeight: window.innerHeight,
@@ -224,11 +230,11 @@
       var el = path[i];
       if (!el || !el.tagName || el === document.body || el === document.documentElement) continue;
       if (!fallback && getAccessibleText(el)) fallback = el;
-      if (isSemanticClickTarget(el) && getAccessibleText(el)) return el;
+      if (isSemanticClickTarget(el) && (getAccessibleText(el) || getAccessibleText(target))) return el;
     }
 
     var closest = target.closest && target.closest('button, a, summary, label, [role="button"], [role="tab"], [role="link"], [role="menuitem"], [role="option"], yt-chip-cloud-chip-renderer, ytd-guide-entry-renderer');
-    if (closest && getAccessibleText(closest)) return closest;
+    if (closest && (getAccessibleText(closest) || getAccessibleText(target))) return closest;
 
     return fallback || target;
   }
@@ -301,6 +307,11 @@
   function getPrimaryElementInRegion(region) {
     var x = Math.max(0, Math.min(window.innerWidth - 1, region.left - window.scrollX + region.width / 2));
     var y = Math.max(0, Math.min(window.innerHeight - 1, region.top - window.scrollY + region.height / 2));
+    var el = getElementBehindAssertionOverlay(x, y);
+    return el;
+  }
+
+  function getElementBehindAssertionOverlay(x, y) {
     var el = document.elementFromPoint(x, y);
     if (!el) return null;
     if (assertionSelectState && (el === assertionSelectState.overlay || el === assertionSelectState.box || el === assertionSelectState.hint)) {
@@ -310,6 +321,34 @@
       assertionSelectState.overlay.style.display = oldDisplay;
     }
     return el;
+  }
+
+  function getClickFallbackAssertionRegion(x, y) {
+    var target = getElementBehindAssertionOverlay(
+      Math.max(0, Math.min(window.innerWidth - 1, x)),
+      Math.max(0, Math.min(window.innerHeight - 1, y))
+    );
+    var rect = target && target.getBoundingClientRect ? target.getBoundingClientRect() : null;
+    if (!rect || !rect.width || !rect.height || target === document.documentElement || target === document.body) {
+      rect = {
+        left: Math.max(0, Math.min(window.innerWidth - 80, x - 40)),
+        top: Math.max(0, Math.min(window.innerHeight - 60, y - 30)),
+        width: 80,
+        height: 60
+      };
+    }
+    return {
+      left: Math.max(0, rect.left) + window.scrollX,
+      top: Math.max(0, rect.top) + window.scrollY,
+      width: Math.max(8, Math.min(rect.width, window.innerWidth - Math.max(0, rect.left))),
+      height: Math.max(8, Math.min(rect.height, window.innerHeight - Math.max(0, rect.top))),
+      viewportWidth: document.documentElement.clientWidth,
+      viewportHeight: document.documentElement.clientHeight,
+      windowWidth: window.innerWidth,
+      windowHeight: window.innerHeight,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY
+    };
   }
 
   function finishAssertionRegionSelect(region) {
@@ -340,6 +379,10 @@
     document.removeEventListener('mousedown', assertionSelectState.onMouseDown, true);
     document.removeEventListener('mousemove', assertionSelectState.onMouseMove, true);
     document.removeEventListener('mouseup', assertionSelectState.onMouseUp, true);
+    window.removeEventListener('pointermove', assertionSelectState.onPointerMove, true);
+    window.removeEventListener('pointerup', assertionSelectState.onPointerUp, true);
+    window.removeEventListener('pointercancel', assertionSelectState.onPointerCancel, true);
+    window.removeEventListener('blur', assertionSelectState.onBlur, true);
     document.removeEventListener('keydown', assertionSelectState.onKeyDown, true);
     if (assertionSelectState.overlay) assertionSelectState.overlay.remove();
     assertionSelectState = null;
@@ -372,44 +415,73 @@
       hint: hint,
       startX: 0,
       startY: 0,
+      pointerId: null,
       dragging: false,
+      completed: false,
       done: done,
-      onMouseDown: function(e) {
+      finish: function(result) {
+        if (!assertionSelectState || assertionSelectState.completed) return;
+        assertionSelectState.completed = true;
+        try {
+          done(result);
+        } catch (e) {}
+      },
+      completeRegion: function(region) {
+        if (!assertionSelectState || assertionSelectState.completed) return;
+        assertionSelectState.completed = true;
+        var data = finishAssertionRegionSelect(region);
+        try {
+          done({ success: true, data: data });
+        } catch (e) {}
+      },
+      updateBox: function(x, y) {
+        if (!assertionSelectState) return;
+        var left = Math.min(assertionSelectState.startX, x);
+        var top = Math.min(assertionSelectState.startY, y);
+        var width = Math.abs(x - assertionSelectState.startX);
+        var height = Math.abs(y - assertionSelectState.startY);
+        box.style.left = left + 'px';
+        box.style.top = top + 'px';
+        box.style.width = width + 'px';
+        box.style.height = height + 'px';
+      },
+      beginDrag: function(e) {
         e.preventDefault();
         e.stopPropagation();
         assertionSelectState.dragging = true;
         assertionSelectState.startX = e.clientX;
         assertionSelectState.startY = e.clientY;
+        assertionSelectState.pointerId = e.pointerId == null ? null : e.pointerId;
+        if (e.currentTarget && e.pointerId != null && e.currentTarget.setPointerCapture) {
+          try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) {}
+        }
         box.style.display = 'block';
         box.style.left = e.clientX + 'px';
         box.style.top = e.clientY + 'px';
         box.style.width = '0px';
         box.style.height = '0px';
       },
-      onMouseMove: function(e) {
+      moveDrag: function(e) {
         if (!assertionSelectState || !assertionSelectState.dragging) return;
+        if (assertionSelectState.pointerId != null && e.pointerId != null && e.pointerId !== assertionSelectState.pointerId) return;
         e.preventDefault();
         e.stopPropagation();
-        var left = Math.min(assertionSelectState.startX, e.clientX);
-        var top = Math.min(assertionSelectState.startY, e.clientY);
-        var width = Math.abs(e.clientX - assertionSelectState.startX);
-        var height = Math.abs(e.clientY - assertionSelectState.startY);
-        box.style.left = left + 'px';
-        box.style.top = top + 'px';
-        box.style.width = width + 'px';
-        box.style.height = height + 'px';
+        assertionSelectState.updateBox(e.clientX, e.clientY);
       },
-      onMouseUp: function(e) {
+      endDrag: function(e) {
         if (!assertionSelectState || !assertionSelectState.dragging) return;
+        if (assertionSelectState.pointerId != null && e.pointerId != null && e.pointerId !== assertionSelectState.pointerId) return;
         e.preventDefault();
         e.stopPropagation();
+        if (e.currentTarget && e.pointerId != null && e.currentTarget.releasePointerCapture) {
+          try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (err) {}
+        }
         var left = Math.min(assertionSelectState.startX, e.clientX);
         var top = Math.min(assertionSelectState.startY, e.clientY);
         var width = Math.abs(e.clientX - assertionSelectState.startX);
         var height = Math.abs(e.clientY - assertionSelectState.startY);
         if (width < 8 || height < 8) {
-          cleanupAssertionRegionSelect();
-          done({ success: false, error: 'Selection is too small' });
+          assertionSelectState.completeRegion(getClickFallbackAssertionRegion(e.clientX, e.clientY));
           return;
         }
         var region = {
@@ -424,20 +496,47 @@
           scrollX: window.scrollX,
           scrollY: window.scrollY
         };
-        done({ success: true, data: finishAssertionRegionSelect(region) });
+        assertionSelectState.completeRegion(region);
+      },
+      onMouseDown: function(e) { assertionSelectState.beginDrag(e); },
+      onMouseMove: function(e) { assertionSelectState.moveDrag(e); },
+      onMouseUp: function(e) { assertionSelectState.endDrag(e); },
+      onPointerDown: function(e) { assertionSelectState.beginDrag(e); },
+      onPointerMove: function(e) { assertionSelectState.moveDrag(e); },
+      onPointerUp: function(e) { assertionSelectState.endDrag(e); },
+      onPointerCancel: function(e) {
+        if (!assertionSelectState || !assertionSelectState.dragging) return;
+        e.preventDefault();
+        e.stopPropagation();
+        assertionSelectState.finish({ success: false, error: 'Selection canceled' });
+        cleanupAssertionRegionSelect();
+      },
+      onBlur: function() {
+        if (!assertionSelectState || assertionSelectState.completed) return;
+        assertionSelectState.finish({ success: false, error: 'Selection canceled' });
+        cleanupAssertionRegionSelect();
       },
       onKeyDown: function(e) {
         if (e.key !== 'Escape') return;
         e.preventDefault();
         e.stopPropagation();
+        assertionSelectState.finish({ success: false, error: 'Selection canceled' });
         cleanupAssertionRegionSelect();
-        done({ success: false, error: 'Selection canceled' });
       }
     };
 
-    document.addEventListener('mousedown', assertionSelectState.onMouseDown, true);
-    document.addEventListener('mousemove', assertionSelectState.onMouseMove, true);
-    document.addEventListener('mouseup', assertionSelectState.onMouseUp, true);
+    if (window.PointerEvent) {
+      overlay.addEventListener('pointerdown', assertionSelectState.onPointerDown, true);
+      window.addEventListener('pointermove', assertionSelectState.onPointerMove, true);
+      window.addEventListener('pointerup', assertionSelectState.onPointerUp, true);
+      window.addEventListener('pointercancel', assertionSelectState.onPointerCancel, true);
+    } else {
+      overlay.addEventListener('mousedown', assertionSelectState.onMouseDown, true);
+      document.addEventListener('mousedown', assertionSelectState.onMouseDown, true);
+      document.addEventListener('mousemove', assertionSelectState.onMouseMove, true);
+      document.addEventListener('mouseup', assertionSelectState.onMouseUp, true);
+    }
+    window.addEventListener('blur', assertionSelectState.onBlur, true);
     document.addEventListener('keydown', assertionSelectState.onKeyDown, true);
   }
 
@@ -464,6 +563,8 @@
       viewportHeight: windowInfo.viewportHeight,
       windowWidth: windowInfo.windowWidth,
       windowHeight: windowInfo.windowHeight,
+      pageUrl: window.location.href,
+      pageTitle: document.title,
       timestamp: new Date().toISOString(),
       target: {
         tagName: target.tagName,
@@ -741,6 +842,8 @@
     var tagName = (target.tagName || '').toUpperCase();
 
     if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT') {
+      var inputType = String(target.type || '').toLowerCase();
+      if (tagName === 'INPUT' && (inputType === 'radio' || inputType === 'checkbox')) return;
       sendAction(buildActionData('focus', e));
       return;
     }

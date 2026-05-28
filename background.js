@@ -179,6 +179,91 @@ function mergeInputAction(previous, next) {
   return merged;
 }
 
+function getLastRecordedUrlForTab(session, tabId) {
+  var urls = session && session.urls ? session.urls : [];
+  for (var i = urls.length - 1; i >= 0; i--) {
+    if (!tabId || urls[i].tabId === tabId) return urls[i];
+  }
+  return urls.length > 0 ? urls[urls.length - 1] : null;
+}
+
+function getActionSortValue(action, fallbackIndex) {
+  if (action && action.timeOffset != null && !isNaN(Number(action.timeOffset))) return Number(action.timeOffset);
+  if (action && action.timestamp) {
+    var ts = new Date(action.timestamp).getTime();
+    if (!isNaN(ts)) return ts;
+  }
+  if (action && action.stepNumber != null && !isNaN(Number(action.stepNumber))) return Number(action.stepNumber);
+  return fallbackIndex || 0;
+}
+
+function normalizeUrlForActionCompare(url) {
+  if (!url) return '';
+  try {
+    var parsed = new URL(url);
+    parsed.hash = '';
+    return parsed.href;
+  } catch (e) {
+    return String(url || '').split('#')[0];
+  }
+}
+
+function isUserActionThatMayNavigate(action) {
+  return action && ['click', 'dblclick', 'keydown', 'submit'].indexOf(action.type) !== -1;
+}
+
+function shouldSkipAutoNavigationAction(action, sessionActions) {
+  if (!action || action.type !== 'navigation' || !sessionActions || sessionActions.length === 0) return false;
+
+  var previous = sessionActions[sessionActions.length - 1];
+  if (!isUserActionThatMayNavigate(previous)) return false;
+
+  var previousTime = getActionSortValue(previous, sessionActions.length - 1);
+  var navigationTime = getActionSortValue(action, sessionActions.length);
+  if (previousTime && navigationTime && Math.abs(navigationTime - previousTime) > 30000) return false;
+
+  var targetUrl = normalizeUrlForActionCompare(action.url || action.pageUrl);
+  var previousPageUrl = normalizeUrlForActionCompare(previous.pageUrl || previous.url);
+  if (!targetUrl || !previousPageUrl || targetUrl === previousPageUrl) return false;
+
+  return true;
+}
+
+function getActionTargetKey(action) {
+  var target = action && action.target ? action.target : {};
+  return [
+    action ? action.type : '',
+    action ? action.tabId : '',
+    action ? action.pageUrl || action.url || '' : '',
+    target.selector || '',
+    target.id || '',
+    target.className || '',
+    target.textContent || '',
+    action && action.x != null ? Math.round(Number(action.x)) : '',
+    action && action.y != null ? Math.round(Number(action.y)) : '',
+    action && action.value != null ? String(action.value) : '',
+    action && action.key != null ? String(action.key) : ''
+  ].join('|');
+}
+
+function getActionTimestampValue(action) {
+  if (action && action.timestamp) {
+    var ts = new Date(action.timestamp).getTime();
+    if (!isNaN(ts)) return ts;
+  }
+  if (action && action.timeOffset != null && !isNaN(Number(action.timeOffset))) return Number(action.timeOffset);
+  return 0;
+}
+
+function isDuplicateRecordedAction(previous, next) {
+  if (!previous || !next) return false;
+  if (previous.type !== next.type) return false;
+  var previousTime = getActionTimestampValue(previous);
+  var nextTime = getActionTimestampValue(next);
+  if (previousTime && nextTime && Math.abs(nextTime - previousTime) > 250) return false;
+  return getActionTargetKey(previous) === getActionTargetKey(next);
+}
+
 function getSessionActionIndexFromHistoryIndex(historyIndex, historyItem) {
   if (!currentSessionId || !recordingSessions[currentSessionId]) return -1;
   var actions = recordingSessions[currentSessionId].actions || [];
@@ -325,7 +410,7 @@ async function recordTabSwitch(fromTabId, toTabId, url, title) {
     currentTabId: currentTabId
   });
 
-  await setTabRecordingStatus(toTabId, true);
+  await setTabRecordingStatus(toTabId, true, { suppressInitialNavigation: true });
 
   chrome.runtime.sendMessage({
     type: 'tabSwitched',
@@ -372,15 +457,24 @@ async function recordAction(action, senderTabId) {
   }
 
   if (currentSessionId && recordingSessions[currentSessionId]) {
-    var urls = recordingSessions[currentSessionId].urls;
-    var lastUrl = urls.length > 0 ? urls[urls.length - 1] : null;
+    var lastUrl = getLastRecordedUrlForTab(recordingSessions[currentSessionId], action.tabId);
     if (lastUrl) {
-      action.pageUrl = lastUrl.url;
-      action.pageTitle = lastUrl.title;
+      action.pageUrl = action.pageUrl || lastUrl.url;
+      action.pageTitle = action.pageTitle || lastUrl.title;
     }
   }
 
   var timeOffset = Date.now() - new Date(recordingSessions[currentSessionId].startTime).getTime();
+  var currentSessionActions = recordingSessions[currentSessionId].actions || [];
+  if (shouldSkipAutoNavigationAction(action, currentSessionActions)) {
+    console.log('skip auto navigation action after user action:', action.url || action.pageUrl);
+    return;
+  }
+  if (isDuplicateRecordedAction(currentSessionActions[currentSessionActions.length - 1], action)) {
+    console.log('skip duplicate recorded action:', action.type, action.target ? action.target.selector || action.target.textContent || action.target.tagName : '');
+    return;
+  }
+
   var shouldReplaceLatestInput = action.type === 'input' &&
     actionHistory.length > 0 &&
     canMergeInputAction(actionHistory[0], action);
@@ -401,7 +495,7 @@ async function recordAction(action, senderTabId) {
   }).catch(function() {});
 
   if (isRecording && currentSessionId && recordingSessions[currentSessionId]) {
-    var sessionActions = recordingSessions[currentSessionId].actions || [];
+    var sessionActions = currentSessionActions;
     var sessionAction = Object.assign({}, action, { timeOffset: timeOffset });
 
     if (action.type === 'input' &&
@@ -737,7 +831,7 @@ chrome.tabs.onUpdated.addListener(async function(tabId, changeInfo, tab) {
 
     if (tabId === currentTabId) {
       if (contentReady) {
-        await setTabRecordingStatus(tabId, true);
+        await setTabRecordingStatus(tabId, true, { suppressInitialNavigation: true });
       }
       // ✅ 只有当URL真正变化时才记录
       var session = recordingSessions[currentSessionId];

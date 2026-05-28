@@ -115,6 +115,8 @@ function normalizeReplaySteps(steps) {
   });
   steps.sort(function(a, b) { return getStepSortValue(a, 0) - getStepSortValue(b, 0); });
   steps = mergeDuplicateNavigationSteps(steps);
+  steps = mergeDuplicateConsecutiveActionSteps(steps);
+  steps = removeSyntheticChoiceFocusSteps(steps);
   steps.forEach(function(step, i) {
     step.stepNumber = i + 1;
     step.assertionResults = [];
@@ -174,6 +176,66 @@ function mergeDuplicateNavigationSteps(steps) {
       normalizeUrlForCompare(previous.url || previous.pageUrl) === normalizeUrlForCompare(step.url || step.pageUrl);
     var closeInTime = Math.abs(getStepSortValue(step, i) - getStepSortValue(previous, i - 1)) <= 1500;
     if (sameNavigation && closeInTime) {
+      mergeAssertions(previous, step);
+      continue;
+    }
+    result.push(step);
+  }
+  return result;
+}
+
+function isSyntheticChoiceFocus(previous, step, index) {
+  if (!previous || !step || step.type !== 'focus') return false;
+  var target = step.target || {};
+  if ((target.tagName || '').toUpperCase() !== 'INPUT') return false;
+  var inputType = String(target.type || '').toLowerCase();
+  if (inputType !== 'radio' && inputType !== 'checkbox') return false;
+  if (previous.type !== 'click') return false;
+  if ((previous.pageUrl || '') !== (step.pageUrl || '')) return false;
+  if (Math.abs(getStepSortValue(step, index) - getStepSortValue(previous, index - 1)) > 500) return false;
+  if (previous.x != null && step.x != null && Math.abs(Number(previous.x) - Number(step.x)) > 3) return false;
+  if (previous.y != null && step.y != null && Math.abs(Number(previous.y) - Number(step.y)) > 3) return false;
+  return true;
+}
+
+function removeSyntheticChoiceFocusSteps(steps) {
+  var result = [];
+  for (var i = 0; i < steps.length; i++) {
+    var step = steps[i];
+    var previous = result[result.length - 1];
+    if (isSyntheticChoiceFocus(previous, step, i)) {
+      mergeAssertions(previous, step);
+      continue;
+    }
+    result.push(step);
+  }
+  return result;
+}
+
+function getActionStepKey(step) {
+  var target = step && step.target ? step.target : {};
+  return [
+    step ? step.type : '',
+    step ? step.tabId : '',
+    step ? step.pageUrl || step.url || '' : '',
+    target.selector || '',
+    target.id || '',
+    target.className || '',
+    target.textContent || '',
+    step && step.x != null ? Math.round(Number(step.x)) : '',
+    step && step.y != null ? Math.round(Number(step.y)) : '',
+    step && step.value != null ? String(step.value) : '',
+    step && step.key != null ? String(step.key) : ''
+  ].join('|');
+}
+
+function mergeDuplicateConsecutiveActionSteps(steps) {
+  var result = [];
+  for (var i = 0; i < steps.length; i++) {
+    var step = steps[i];
+    var previous = result[result.length - 1];
+    var closeInTime = previous && Math.abs(getStepSortValue(step, i) - getStepSortValue(previous, i - 1)) <= 250;
+    if (previous && previous.type === step.type && closeInTime && getActionStepKey(previous) === getActionStepKey(step)) {
       mergeAssertions(previous, step);
       continue;
     }
